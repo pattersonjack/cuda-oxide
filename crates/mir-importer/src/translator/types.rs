@@ -514,19 +514,44 @@ pub fn translate_type(
                     )
                     .into())
                 } else {
-                    // Enums have multiple variants
-                    // Determine discriminant type based on number of variants
-                    let discriminant_bits = if variants.len() <= 256 {
-                        8
-                    } else if variants.len() <= 65536 {
-                        16
-                    } else {
-                        32
-                    };
+                    // Enums have multiple variants.
+                    //
+                    // Determine the discriminant type. If the user wrote an
+                    // explicit `#[repr(uN)]` / `#[repr(iN)]` / `#[repr(usize)]`
+                    // / `#[repr(isize)]`, honour that width and signedness so
+                    // that `*const E` pointer arithmetic and per-element loads
+                    // stride / size correctly. Otherwise fall back to the
+                    // smallest unsigned width that fits all variants (the
+                    // rustc default for plain `enum E { .. }`).
+                    let (discriminant_bits, discriminant_signed): (u32, bool) =
+                        match adt_def.repr().int {
+                            Some(rustc_public::abi::IntegerType::Fixed { length, is_signed }) => {
+                                (length.bits() as u32, is_signed)
+                            }
+                            Some(rustc_public::abi::IntegerType::Pointer { is_signed }) => {
+                                // `#[repr(isize)]` / `#[repr(usize)]`. NVPTX
+                                // targets pointer-sized integers as 64-bit.
+                                (64u32, is_signed)
+                            }
+                            None => {
+                                let bits: u32 = if variants.len() <= 256 {
+                                    8
+                                } else if variants.len() <= 65536 {
+                                    16
+                                } else {
+                                    32
+                                };
+                                (bits, false)
+                            }
+                        };
                     let discriminant_ty = pliron::builtin::types::IntegerType::get(
                         ctx,
                         discriminant_bits,
-                        pliron::builtin::types::Signedness::Unsigned,
+                        if discriminant_signed {
+                            pliron::builtin::types::Signedness::Signed
+                        } else {
+                            pliron::builtin::types::Signedness::Unsigned
+                        },
                     );
 
                     // Translate each variant
