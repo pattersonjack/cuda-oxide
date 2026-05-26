@@ -126,6 +126,8 @@ The `examples/` directory contains standalone kernel crates that exercise differ
 | `clc`                        | Cluster Launch Control                               |
 | `warp_reduce`                | Warp-level reductions                                |
 | `cpp_consumes_rust_device`   | C++ host code consuming Rust-generated PTX           |
+| `device_ffi_test`            | Rust kernels calling external C++/CCCL functions via LTOIR |
+| `mathdx_ffi_test`            | MathDx FFI: cuFFTDx thread-level FFT + cuBLASDx block GEMM |
 
 Run any example with:
 
