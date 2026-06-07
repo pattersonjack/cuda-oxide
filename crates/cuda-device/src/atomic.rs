@@ -127,7 +127,7 @@ pub enum AtomicOrdering {
 /// - `new(val)` — constructor
 /// - `from_ptr(ptr)` — non-owning view over existing `*mut T` memory
 /// - `load`, `store` — atomic load/store
-/// - `fetch_add`, `fetch_sub` — arithmetic RMW
+/// - `fetch_add`, `fetch_sub`: arithmetic RMW
 /// - `fetch_and`, `fetch_or`, `fetch_xor` — bitwise RMW
 /// - `fetch_min`, `fetch_max` — comparison RMW
 /// - `swap` — atomic exchange
@@ -216,7 +216,7 @@ macro_rules! define_integer_atomic {
                 unreachable!(concat!(stringify!($Name), "::fetch_add called outside CUDA kernel context"))
             }
 
-            /// Atomically subtract `val` and return the **previous** value.
+            /// Atomically subtract `val` and return the previous value.
             #[inline(never)]
             pub fn fetch_sub(&self, val: $ty, order: AtomicOrdering) -> $ty {
                 let _ = (val, order);
@@ -324,7 +324,7 @@ macro_rules! define_integer_atomic {
 /// - `new(val)` — constructor
 /// - `from_ptr(ptr)` — non-owning view over existing `*mut T` memory
 /// - `load`, `store` — atomic load/store
-/// - `fetch_add` — atomic add (hardware `atom.add.f32/f64`, LLVM `atomicrmw fadd`)
+/// - `fetch_add`, `fetch_sub`: arithmetic RMW
 /// - `swap` — atomic exchange (`atomicrmw xchg`)
 ///
 /// **Not supported** (PTX hardware limitation):
@@ -397,12 +397,20 @@ macro_rules! define_float_atomic {
 
             /// Atomically add `val` and return the **previous** value.
             ///
-            /// Uses hardware `atom.add.f32` / `atom.add.f64` via LLVM
-            /// `atomicrmw fadd`.
+            /// Uses LLVM `atomicrmw fadd`.
             #[inline(never)]
             pub fn fetch_add(&self, val: $ty, order: AtomicOrdering) -> $ty {
                 let _ = (val, order);
                 unreachable!(concat!(stringify!($Name), "::fetch_add called outside CUDA kernel context"))
+            }
+
+            /// Atomically subtract `val` and return the previous value.
+            ///
+            /// Uses LLVM `atomicrmw fsub`.
+            #[inline(never)]
+            pub fn fetch_sub(&self, val: $ty, order: AtomicOrdering) -> $ty {
+                let _ = (val, order);
+                unreachable!(concat!(stringify!($Name), "::fetch_sub called outside CUDA kernel context"))
             }
 
             // ── Exchange ───────────────────────────────────────────────
@@ -442,6 +450,13 @@ define_integer_atomic! {
 define_integer_atomic! {
     /// 64-bit signed atomic, **device scope** (`.gpu`).
     pub struct DeviceAtomicI64(i64);
+}
+
+define_float_atomic! {
+    /// 16 bit float atomic, device scope (`.gpu`).
+    ///
+    /// `fetch_add`/`fetch_sub` lower to hardware `atom.add.noftz.f16` (sm_70+).
+    pub struct DeviceAtomicF16(f16);
 }
 
 define_float_atomic! {
@@ -486,6 +501,13 @@ define_integer_atomic! {
 define_integer_atomic! {
     /// 64-bit signed atomic, **block scope** (`.cta`).
     pub struct BlockAtomicI64(i64);
+}
+
+define_float_atomic! {
+    /// 16 bit float atomic, block scope (`.cta`).
+    ///
+    /// `fetch_add`/`fetch_sub` lower to `atom.add.noftz.f16` with `.cta` scope.
+    pub struct BlockAtomicF16(f16);
 }
 
 define_float_atomic! {

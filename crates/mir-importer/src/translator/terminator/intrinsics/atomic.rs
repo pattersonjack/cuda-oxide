@@ -36,7 +36,7 @@
 //! | Method       | Integer RMW Kind   | Float RMW Kind |
 //! |--------------|--------------------|----------------|
 //! | `fetch_add`  | `Add`              | `FAdd`         |
-//! | `fetch_sub`  | `Sub`              | —              |
+//! | `fetch_sub`  | `Sub`              | `FAdd(-x)`     |
 //! | `fetch_and`  | `And`              | —              |
 //! | `fetch_or`   | `Or`               | —              |
 //! | `fetch_xor`  | `Xor`              | —              |
@@ -72,6 +72,8 @@ use dialect_nvvm::ops::atomic::{
     NvvmAtomicRmwOp, NvvmAtomicStoreOp,
 };
 
+use dialect_mir::ops::MirNegOp;
+use dialect_mir::types::MirFP16Type;
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::types::{FP32Type, FP64Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
@@ -79,6 +81,7 @@ use pliron::input_err;
 use pliron::location::{Located, Location};
 use pliron::op::Op;
 use pliron::operation::Operation;
+use pliron::r#type::Typed;
 use rustc_public::mir;
 use rustc_public::ty::{GenericArgKind, RigidTy, TyConstKind, TyKind};
 // =============================================================================
@@ -100,6 +103,9 @@ impl AtomicTypeInfo {
     fn element_type(&self, ctx: &mut Context) -> Ptr<pliron::r#type::TypeObj> {
         if self.is_float {
             match self.bit_width {
+                // Rust `f16` is represented by dialect-mir's own `mir.fp16` (apfloat::Half);
+                // f32/f64 reuse the pliron builtin float types.
+                16 => MirFP16Type::get(ctx).into(),
                 32 => FP32Type::get(ctx).into(),
                 64 => FP64Type::get(ctx).into(),
                 _ => unreachable!("unsupported float atomic width: {}", self.bit_width),
@@ -136,6 +142,7 @@ fn parse_atomic_type_name(type_name: &str) -> Option<AtomicTypeInfo> {
         "I32" => (32, false, true),
         "U64" => (64, false, false),
         "I64" => (64, false, true),
+        "F16" => (16, true, false),
         "F32" => (32, true, false),
         "F64" => (64, true, false),
         _ => return None,
@@ -177,7 +184,8 @@ fn parse_atomic_path(path: &str) -> Option<(AtomicTypeInfo, &str)> {
 /// - Unsigned types (U32, U64) → `UMin`/`UMax`
 /// - Signed types (I32, I64) → `Min`/`Max`
 ///
-/// For `fetch_add` on float types → `FAdd` (hardware `atom.add.f32/f64`).
+/// For float `fetch_add`, use `FAdd`; float `fetch_sub` is handled as
+/// `FAdd(-x)` at emission time so LLVM can use native PTX add atomics.
 fn method_to_rmw_kind(method: &str, info: &AtomicTypeInfo) -> Option<AtomicRmwKind> {
     match method {
         "fetch_add" => {
@@ -187,7 +195,13 @@ fn method_to_rmw_kind(method: &str, info: &AtomicTypeInfo) -> Option<AtomicRmwKi
                 Some(AtomicRmwKind::Add)
             }
         }
-        "fetch_sub" => Some(AtomicRmwKind::Sub),
+        "fetch_sub" => {
+            if info.is_float {
+                Some(AtomicRmwKind::FAdd)
+            } else {
+                Some(AtomicRmwKind::Sub)
+            }
+        }
         "fetch_and" => Some(AtomicRmwKind::And),
         "fetch_or" => Some(AtomicRmwKind::Or),
         "fetch_xor" => Some(AtomicRmwKind::Xor),
@@ -296,6 +310,7 @@ pub fn dispatch(
         "fetch_add" | "fetch_sub" | "fetch_and" | "fetch_or" | "fetch_xor" | "fetch_min"
         | "fetch_max" | "swap" => {
             let rmw_kind = method_to_rmw_kind(method, &type_info).unwrap();
+            let negate_value = type_info.is_float && method == "fetch_sub";
             Ok(Some(emit_atomic_rmw(
                 ctx,
                 body,
@@ -309,6 +324,7 @@ pub fn dispatch(
                 loc,
                 &type_info,
                 rmw_kind,
+                negate_value,
             )?))
         }
 
@@ -511,6 +527,7 @@ fn emit_atomic_rmw(
     loc: Location,
     type_info: &AtomicTypeInfo,
     rmw_kind: AtomicRmwKind,
+    negate_value: bool,
 ) -> TranslationResult<Ptr<Operation>> {
     if args.len() != 3 {
         return input_err!(
@@ -546,6 +563,26 @@ fn emit_atomic_rmw(
         last_op,
         loc.clone(),
     )?;
+
+    let (val, last_op) = if negate_value {
+        let neg_op = Operation::new(
+            ctx,
+            MirNegOp::get_concrete_op_info(),
+            vec![val.get_type(ctx)],
+            vec![val],
+            vec![],
+            0,
+        );
+        neg_op.deref_mut(ctx).set_loc(loc.clone());
+        if let Some(prev) = last_op {
+            neg_op.insert_after(ctx, prev);
+        } else {
+            neg_op.insert_at_front(block_ptr, ctx);
+        }
+        (neg_op.deref(ctx).get_result(0), Some(neg_op))
+    } else {
+        (val, last_op)
+    };
 
     let nvvm_op = NvvmAtomicRmwOp::build(
         ctx,
