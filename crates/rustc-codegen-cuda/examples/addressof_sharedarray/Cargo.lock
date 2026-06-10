@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "addressof_sharedarray_repro"
+name = "addressof_sharedarray"
 version = "0.1.0"
 dependencies = [
  "cuda-core",
