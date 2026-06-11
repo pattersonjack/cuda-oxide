@@ -25,6 +25,8 @@
 //! - `s.field` → Field-address from the slot, then `mir.store`
 //! - `(*ptr).field` → Load pointer, compute field address, store
 //! - `s.outer.inner` → Chained field-address from the slot, then store
+//! - `(*ptr)[i]` → Element address from the unified place-address walker
+//!   (handles both `&mut [T; N]` and fat `&mut [T]` bases), then store
 
 use super::types;
 use crate::error::{TranslationErr, TranslationResult};
@@ -605,6 +607,76 @@ pub fn translate_statement(
                         store_op.deref_mut(ctx).set_loc(loc);
                         store_op.insert_after(ctx, inner_addr_op);
 
+                        Ok(Some(store_op))
+                    }
+                    (
+                        mir::ProjectionElem::Deref,
+                        mir::ProjectionElem::Index(_) | mir::ProjectionElem::ConstantIndex { .. },
+                    ) => {
+                        // `(*ptr)[i] = value`, e.g. `a[i] = v` where `a` is
+                        // `&mut [T; N]` (thin pointer to an array) or
+                        // `&mut [T]` (fat slice pointer).
+                        //
+                        // Alloca model: the unified place-address walker
+                        // (`rvalue::translate_place_address`) computes the
+                        // element's address. It loads the pointer for the
+                        // `Deref` (extracting the thin data pointer when the
+                        // pointee is slice-shaped) and applies the index, so
+                        // the store below writes to the ORIGINAL storage.
+
+                        let mut current_prev = prev_op;
+                        if let Some(rvalue_op) = rvalue_op_opt {
+                            if let Some(prev) = last_inserted {
+                                rvalue_op.insert_after(ctx, prev);
+                                current_prev = Some(rvalue_op);
+                            } else if let Some(prev) = prev_op {
+                                rvalue_op.insert_after(ctx, prev);
+                                current_prev = Some(rvalue_op);
+                            } else {
+                                rvalue_op.insert_at_front(block_ptr, ctx);
+                                current_prev = Some(rvalue_op);
+                            }
+                        } else if let Some(prev) = last_inserted {
+                            current_prev = Some(prev);
+                        }
+
+                        // The destination is written through, so request a
+                        // mutable address.
+                        let Some((elem_ptr, prev_after_addr)) = rvalue::translate_place_address(
+                            ctx,
+                            body,
+                            value_map,
+                            place,
+                            true,
+                            block_ptr,
+                            current_prev,
+                            loc.clone(),
+                        )?
+                        else {
+                            return input_err!(
+                                loc,
+                                TranslationErr::unsupported(format!(
+                                    "cannot compute the destination address for the indexed \
+                                     assignment through a pointer (projection {:?})",
+                                    place.projection
+                                ))
+                            );
+                        };
+                        let current_prev = prev_after_addr.or(current_prev);
+
+                        let store_op = Operation::new(
+                            ctx,
+                            MirStoreOp::get_concrete_op_info(),
+                            vec![],
+                            vec![elem_ptr, result_value],
+                            vec![],
+                            0,
+                        );
+                        store_op.deref_mut(ctx).set_loc(loc);
+                        match current_prev {
+                            Some(prev) => store_op.insert_after(ctx, prev),
+                            None => store_op.insert_at_front(block_ptr, ctx),
+                        }
                         Ok(Some(store_op))
                     }
                     _ => input_err!(
