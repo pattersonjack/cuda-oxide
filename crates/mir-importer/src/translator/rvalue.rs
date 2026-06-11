@@ -3331,7 +3331,7 @@ fn apply_enum_field_projection(
 /// copy are fine) or the construct must be rejected (mutable borrows / raw
 /// mut pointers: writes through a copy are silently lost).
 #[allow(clippy::too_many_arguments)]
-fn translate_place_address(
+pub(crate) fn translate_place_address(
     ctx: &mut Context,
     body: &mir::Body,
     value_map: &ValueMap,
@@ -3364,11 +3364,16 @@ fn translate_place_address(
 ///
 /// - `Field(idx, _)`   → [`MirFieldAddrOp`]
 /// - `ConstantIndex {offset, from_end: false, ..}` → `MirConstantOp` + [`MirArrayElementAddrOp`]
+///   (array pointee) or `MirConstantOp` + [`MirPtrOffsetOp`] (slice data pointer)
 /// - `Index(local)`    → `load_local(local)` + [`MirArrayElementAddrOp`]
+///   (array pointee) or `load_local(local)` + [`MirPtrOffsetOp`] (slice data pointer)
 /// - `Deref`           → `MirLoadOp` of the pointer (the loaded pointer IS
 ///   the pointee's address); subsequent projections apply to the pointee.
-///   ZST pointees skip the load (SharedArray exception) and fat
-///   (slice-shaped) pointees are never walked through -- see the arm.
+///   ZST pointees skip the load (SharedArray exception). Fat (slice-shaped)
+///   pointees scalarize to a (data ptr, len) pair: a mid-chain fat deref
+///   loads the whole fat value and extracts the thin data pointer (field 0)
+///   so the walk continues against the ORIGINAL elements, while a trailing
+///   fat deref (`&*s` reborrow) is just a load of the fat value.
 ///
 /// `Downcast` (enum payload addressing; issues #131/#146), `Subslice` and
 /// from-end `ConstantIndex` are NOT handled; the walker punts on them
@@ -3417,15 +3422,22 @@ fn translate_place_addr_from_slot(
                         None => return Ok(None),
                     }
                 };
-                let (pointee_is_zst_tuple, pointee_is_thin_ptr, pointee_is_fat) = {
+                let (pointee_is_zst_tuple, pointee_is_thin_ptr, fat_elem_ty) = {
                     let p_ref = place_ty.deref(ctx);
                     let is_zst_tuple = p_ref
                         .downcast_ref::<dialect_mir::types::MirTupleType>()
                         .is_some_and(|tt| tt.get_types().is_empty());
                     let is_thin_ptr = p_ref.is::<dialect_mir::types::MirPtrType>();
-                    let is_fat = p_ref.is::<dialect_mir::types::MirSliceType>()
-                        || p_ref.is::<dialect_mir::types::MirDisjointSliceType>();
-                    (is_zst_tuple, is_thin_ptr, is_fat)
+                    // Slice-shaped (fat) pointees carry their element type.
+                    let fat_elem_ty = p_ref
+                        .downcast_ref::<dialect_mir::types::MirSliceType>()
+                        .map(|st| st.element_type())
+                        .or_else(|| {
+                            p_ref
+                                .downcast_ref::<dialect_mir::types::MirDisjointSliceType>()
+                                .map(|st| st.element_type())
+                        });
+                    (is_zst_tuple, is_thin_ptr, fat_elem_ty)
                 };
 
                 if pointee_is_zst_tuple {
@@ -3439,33 +3451,58 @@ fn translate_place_addr_from_slot(
                 }
 
                 let is_last = proj_idx + 1 == projection.len();
-                if pointee_is_fat {
+                if let Some(elem_ty) = fat_elem_ty {
                     // Slice-shaped places (`&[T]`, `DisjointSlice<T>`)
-                    // scalarize to (ptr, len). Dereferencing THROUGH them
-                    // with a single `mir.load` would treat the fat value as
-                    // a thin address -- a silent miscompile -- so we never
-                    // continue the walk into a fat pointee.
-                    if is_last {
-                        // Trailing `&*s` reborrow: the borrow result IS the
-                        // fat value, which lives whole in the slot, so a
-                        // load of the slot is exactly right (and is what
-                        // the pre-unification reborrow case emitted).
-                    } else if is_mutable {
-                        return input_err!(
-                            loc,
-                            TranslationErr::unsupported(format!(
-                                "cannot compute a mutable in-memory address through \
-                                 fat-pointer deref (projection {:?}); slices scalarize \
-                                 to (ptr, len) and a single load would misread the \
-                                 fat value as a thin address",
-                                projection
-                            ))
+                    // scalarize to a (data ptr, len) pair, so a single
+                    // `mir.load` of the slot must NOT be treated as a thin
+                    // address -- it yields the whole fat value.
+                    if !is_last {
+                        // Mid-chain deref (`s[i]` through `&mut [T]`, the
+                        // inlined body of `slice::get_mut`, ...): load the
+                        // whole fat value, then extract field 0 -- the thin
+                        // data pointer. That pointer addresses the ORIGINAL
+                        // elements, so both shared and mutable borrows stay
+                        // sound. The following `Index` / `ConstantIndex`
+                        // offsets it directly (its pointee is the element
+                        // type, not an array), see the `Direct` paths below.
+                        let load_op = Operation::new(
+                            ctx,
+                            MirLoadOp::get_concrete_op_info(),
+                            vec![place_ty],
+                            vec![current],
+                            vec![],
+                            0,
                         );
-                    } else {
-                        // Shared borrow: let the caller fall back to a value
-                        // copy, which is sound for reads.
-                        return Ok(None);
+                        load_op.deref_mut(ctx).set_loc(loc.clone());
+                        match current_prev_op {
+                            Some(p) => load_op.insert_after(ctx, p),
+                            None => load_op.insert_at_front(block_ptr, ctx),
+                        }
+                        let fat_value = load_op.deref(ctx).get_result(0);
+
+                        let thin_ptr_ty =
+                            dialect_mir::types::MirPtrType::get_generic(ctx, elem_ty, is_mutable);
+                        let extract_op = Operation::new(
+                            ctx,
+                            MirExtractFieldOp::get_concrete_op_info(),
+                            vec![thin_ptr_ty.into()],
+                            vec![fat_value],
+                            vec![],
+                            0,
+                        );
+                        extract_op.deref_mut(ctx).set_loc(loc.clone());
+                        MirExtractFieldOp::new(extract_op)
+                            .set_attr_index(ctx, dialect_mir::attributes::FieldIndexAttr(0));
+                        extract_op.insert_after(ctx, load_op);
+                        current = extract_op.deref(ctx).get_result(0);
+                        current_prev_op = Some(extract_op);
+                        continue;
                     }
+                    // Trailing `&*s` reborrow: the borrow result IS the
+                    // fat value, which lives whole in the slot, so a
+                    // load of the slot is exactly right (and is what
+                    // the pre-unification reborrow case emitted). Fall
+                    // through to the plain load below.
                 } else if !pointee_is_thin_ptr {
                     // Deref of a non-pointer-typed place (a type the
                     // importer models by value); punt to the caller.
@@ -3522,13 +3559,9 @@ fn translate_place_addr_from_slot(
                 if *from_end {
                     return Ok(None);
                 }
-                let (element_ty, addr_space) = match pointer_pointee_kind(ctx, current) {
+                let (pointee_kind, addr_space) = match pointer_pointee_kind(ctx, current) {
                     Some(kind) => kind,
                     None => return Ok(None),
-                };
-                let element_ty = match element_ty {
-                    PointeeKind::Array(elem_ty) => elem_ty,
-                    PointeeKind::Other => return Ok(None),
                 };
 
                 let i64_ty = IntegerType::get(ctx, 64, Signedness::Signed);
@@ -3551,13 +3584,27 @@ fn translate_place_addr_from_slot(
                 current_prev_op = Some(const_op_ptr);
                 let index_val = const_op_ptr.deref(ctx).get_result(0);
 
-                let elem_ptr_ty =
-                    dialect_mir::types::MirPtrType::get(ctx, element_ty, is_mutable, addr_space)
-                        .into();
+                // Array pointee: GEP through the array type. Anything else
+                // (the slice data pointer produced by the fat `Deref` arm
+                // above) already points directly at elements, so a plain
+                // pointer offset is the element's address.
+                let (addr_op_info, addr_result_ty) = match pointee_kind {
+                    PointeeKind::Array(element_ty) => (
+                        MirArrayElementAddrOp::get_concrete_op_info(),
+                        dialect_mir::types::MirPtrType::get(
+                            ctx, element_ty, is_mutable, addr_space,
+                        )
+                        .into(),
+                    ),
+                    PointeeKind::Direct => (
+                        MirPtrOffsetOp::get_concrete_op_info(),
+                        current.get_type(ctx),
+                    ),
+                };
                 let addr_op = Operation::new(
                     ctx,
-                    MirArrayElementAddrOp::get_concrete_op_info(),
-                    vec![elem_ptr_ty],
+                    addr_op_info,
+                    vec![addr_result_ty],
                     vec![current, index_val],
                     vec![],
                     0,
@@ -3576,13 +3623,9 @@ fn translate_place_addr_from_slot(
             // and return a pointer to the array's first slot, miscompiling
             // every load through the reference into a load of element 0.
             mir::ProjectionElem::Index(index_local) => {
-                let (element_ty, addr_space) = match pointer_pointee_kind(ctx, current) {
+                let (pointee_kind, addr_space) = match pointer_pointee_kind(ctx, current) {
                     Some(kind) => kind,
                     None => return Ok(None),
-                };
-                let element_ty = match element_ty {
-                    PointeeKind::Array(elem_ty) => elem_ty,
-                    PointeeKind::Other => return Ok(None),
                 };
 
                 let index_place = mir::Place {
@@ -3600,13 +3643,27 @@ fn translate_place_addr_from_slot(
                 )?;
                 current_prev_op = next_prev_op;
 
-                let elem_ptr_ty =
-                    dialect_mir::types::MirPtrType::get(ctx, element_ty, is_mutable, addr_space)
-                        .into();
+                // Array pointee: GEP through the array type. Anything else
+                // (the slice data pointer produced by the fat `Deref` arm
+                // above) already points directly at elements, so a plain
+                // pointer offset is the element's address.
+                let (addr_op_info, addr_result_ty) = match pointee_kind {
+                    PointeeKind::Array(element_ty) => (
+                        MirArrayElementAddrOp::get_concrete_op_info(),
+                        dialect_mir::types::MirPtrType::get(
+                            ctx, element_ty, is_mutable, addr_space,
+                        )
+                        .into(),
+                    ),
+                    PointeeKind::Direct => (
+                        MirPtrOffsetOp::get_concrete_op_info(),
+                        current.get_type(ctx),
+                    ),
+                };
                 let addr_op = Operation::new(
                     ctx,
-                    MirArrayElementAddrOp::get_concrete_op_info(),
-                    vec![elem_ptr_ty],
+                    addr_op_info,
+                    vec![addr_result_ty],
                     vec![current, index_val],
                     vec![],
                     0,
@@ -3641,11 +3698,18 @@ fn translate_place_addr_from_slot(
     Ok(Some((current, current_prev_op)))
 }
 
-/// Describes what a pointer points to (array vs. other) for address-computation
-/// dispatch.
+/// Describes what a pointer points to (array vs. anything else) for
+/// address-computation dispatch.
 enum PointeeKind {
+    /// Pointee is `[T; N]` (carries `T`). Element addressing GEPs through
+    /// the array type via `mir.array_element_addr`.
     Array(Ptr<TypeObj>),
-    Other,
+    /// Pointee is any other type. When an `Index` / `ConstantIndex`
+    /// projection meets such a pointer, MIR typing guarantees the indexed
+    /// place is a slice whose data pointer (produced by the fat-pointer
+    /// `Deref` arm) points directly at the elements, so element addressing
+    /// is a plain `mir.ptr_offset` keeping the pointer's own type.
+    Direct,
 }
 
 /// Inspect a pointer value and return its pointee kind + address space, or
@@ -3661,7 +3725,7 @@ fn pointer_pointee_kind(ctx: &Context, ptr_value: Value) -> Option<(PointeeKind,
     {
         PointeeKind::Array(arr_ty.element_type())
     } else {
-        PointeeKind::Other
+        PointeeKind::Direct
     };
     Some((kind, addr_space))
 }
