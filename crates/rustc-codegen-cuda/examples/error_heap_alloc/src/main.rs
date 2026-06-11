@@ -32,6 +32,9 @@ pub fn heap_alloc_kernel(out: DisjointSlice<u32>) {
     let mut out = out;
     let idx = thread::index_1d();
     // BUG UNDER TEST: `vec!` heap-allocates; there is no device allocator.
+    // The vec! IS the shape under test, so the "use an array" lint is
+    // exactly the rewrite this fixture must not perform.
+    #[allow(clippy::useless_vec)]
     let v = vec![1u32, 2, 3, 4];
     if let Some(slot) = out.get_mut(idx) {
         *slot = v[0];

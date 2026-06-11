@@ -44,6 +44,11 @@ pub fn vecadd_device(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) {
 /// helper. The real allocator entry points are recognized by sysroot
 /// origin, never by name alone. This helper adds 0.0, so the example's
 /// expected results are unchanged.
+// The #[device] macro prefixes the internal symbol with
+// `cuda_oxide_device_<hash>_`, and the double underscore in the probe's
+// name makes that generated identifier trip the snake-case lint. The
+// odd name is the entire point of the probe, so allow it here.
+#[allow(non_snake_case)]
 #[device]
 pub fn __rust_alloc(x: f32) -> f32 {
     x
