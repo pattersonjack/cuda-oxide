@@ -607,16 +607,23 @@ pub fn translate_type(
                                 tag_encoding: rustc_public::abi::TagEncoding::Niche { .. },
                                 ..
                             } => {
-                                // Niched enums are deliberately modelled
-                                // un-niched: `MirEnumType` keeps an explicit
-                                // variant-count tag and mir-lower rebuilds the
-                                // un-niched aggregate from `NicheEncodingAttr`
+                                // Niche-encoded enums (e.g. Option<&T>) store
+                                // no tag in rustc's layout; the variant is
+                                // COMPUTED from the payload (null means None).
+                                // Our discriminant/construct ops only know the
+                                // load-a-tag / store-a-tag shape, so until
+                                // that decode logic is ported, the device
+                                // models these enums with an explicit
+                                // variant-count tag of its own, and mir-lower
+                                // rebuilds the aggregate from
+                                // `NicheEncodingAttr`
                                 // (`emit_scalar_to_niched_enum`). Reading
-                                // rustc's niche tag (which is the payload
-                                // scalar itself) here would break that
-                                // contract. Size/align stay 0: the un-niched
-                                // aggregate's size has nothing to do with
-                                // rustc's niched size.
+                                // rustc's niche tag (the payload scalar
+                                // itself) here would break that contract.
+                                // Size/align stay 0 ("layout not recorded"):
+                                // this model is device-private and must never
+                                // meet host bytes; the kernel-boundary check
+                                // in mir-lower enforces exactly that.
                                 let tag_ty = pliron::builtin::types::IntegerType::get(
                                     ctx,
                                     variant_count_bits,

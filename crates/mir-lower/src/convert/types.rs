@@ -909,6 +909,19 @@ pub(crate) fn convert_enum_to_llvm(
 ///   (e.g. `Result<T, Infallible>`): same story, the device tag has no
 ///   host counterpart.
 ///
+/// WHY the device differs at all: nothing in the hardware demands it.
+/// With a real tag, "which variant?" is a one-field load and
+/// "construct" is a one-field store, which is all our discriminant and
+/// construct ops know how to be. With a niche there is no tag to load:
+/// the discriminant must be COMPUTED from the payload (null check,
+/// byte-range check, in general rustc's get_discr range arithmetic),
+/// and constructing `None` means writing a magic payload value. That
+/// per-enum decode/encode logic has not been ported yet, so the device
+/// keeps a synthetic tag, which is fine while the bytes stay on the
+/// device and a lie the moment they meet host memory. Porting the
+/// niche logic is the follow-up that would erase this difference and
+/// retire this check.
+///
 /// One-variant enums with `total_size == 0` are fine: there is nothing
 /// for the two sides to disagree about.
 ///
