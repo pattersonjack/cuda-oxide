@@ -181,3 +181,128 @@ pub fn drain() -> usize {
     }
     reclaimed
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    /// Serializes the tests in this module: they share the global limbo,
+    /// and `drain` consumes (and waits on) every parked entry.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_lock() -> MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Host-side stand-in for a recorded CUDA event.
+    struct MockGate {
+        /// Mirrors "the device timeline has passed the recorded event".
+        passed: Arc<AtomicBool>,
+        /// When `true`, the blocking wait reports a driver failure.
+        wait_fails: bool,
+    }
+
+    impl ReclaimGate for MockGate {
+        fn passed(&self) -> Result<bool, DriverError> {
+            Ok(self.passed.load(Ordering::Relaxed))
+        }
+
+        fn wait(&self) -> Result<(), DriverError> {
+            if self.wait_fails {
+                Err(DriverError(
+                    cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
+                ))
+            } else {
+                self.passed.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+    }
+
+    struct CountDrop(Arc<AtomicUsize>);
+
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn sweep_keeps_payload_parked_until_gate_passes() {
+        let _guard = test_lock();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let gate_passed = Arc::new(AtomicBool::new(false));
+
+        park(
+            MockGate {
+                passed: Arc::clone(&gate_passed),
+                wait_fails: false,
+            },
+            Box::new(CountDrop(Arc::clone(&drops))),
+        );
+
+        sweep();
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            0,
+            "payload must stay parked while the GPU work is in flight"
+        );
+
+        gate_passed.store(true, Ordering::Relaxed);
+        sweep();
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            1,
+            "payload must drop once the gate reports completion"
+        );
+    }
+
+    #[test]
+    fn drain_waits_for_gate_then_drops_payload() {
+        let _guard = test_lock();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let gate_passed = Arc::new(AtomicBool::new(false));
+
+        park(
+            MockGate {
+                passed: Arc::clone(&gate_passed),
+                wait_fails: false,
+            },
+            Box::new(CountDrop(Arc::clone(&drops))),
+        );
+
+        let reclaimed = drain();
+        assert_eq!(reclaimed, 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert!(
+            gate_passed.load(Ordering::Relaxed),
+            "drain must have waited on the gate before dropping"
+        );
+    }
+
+    #[test]
+    fn drain_leaks_payload_when_wait_fails() {
+        let _guard = test_lock();
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        park(
+            MockGate {
+                passed: Arc::new(AtomicBool::new(false)),
+                wait_fails: true,
+            },
+            Box::new(CountDrop(Arc::clone(&drops))),
+        );
+
+        let reclaimed = drain();
+        assert_eq!(reclaimed, 0);
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            0,
+            "an unprovable gate must leak the payload, never drop it early"
+        );
+    }
+}

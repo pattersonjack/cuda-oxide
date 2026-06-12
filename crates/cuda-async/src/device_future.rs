@@ -424,6 +424,57 @@ mod tests {
         assert!(future.result.is_none());
     }
 
+    /// The shape left behind by issue #99's second path: `execute()`
+    /// succeeded (GPU work submitted, `result` populated) but
+    /// `register_callback()` failed, so poll flipped the state to
+    /// `Complete` with the result still stored. Cleanup must treat that
+    /// exactly like a cancelled `Executing` future.
+    #[test]
+    fn cleanup_covers_complete_future_left_by_callback_registration_failure() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let tracker = DropTracker {
+            events: Arc::clone(&events),
+        };
+        let mut future: DeviceFuture<DropTracker, Value<DropTracker>> = DeviceFuture {
+            device_operation: None,
+            execution_context: None,
+            result: Some(tracker),
+            error: None,
+            state: DeviceFutureState::Complete,
+            callback_state: None,
+        };
+
+        assert!(future.has_undelivered_submission());
+        future.cleanup_executing_result_with(|| {
+            events.lock().unwrap().push("sync");
+            Ok(())
+        });
+
+        assert_eq!(events.lock().unwrap().as_slice(), ["sync", "drop"]);
+        assert!(future.result.is_none());
+        assert!(!future.has_undelivered_submission());
+    }
+
+    /// A `Complete` future whose result was already delivered to the caller
+    /// has nothing to reclaim.
+    #[test]
+    fn cleanup_is_noop_after_result_delivery() {
+        let mut future: DeviceFuture<u32, Value<u32>> = DeviceFuture {
+            device_operation: None,
+            execution_context: None,
+            result: None,
+            error: None,
+            state: DeviceFutureState::Complete,
+            callback_state: None,
+        };
+
+        assert!(!future.has_undelivered_submission());
+        future.cleanup_executing_result_with(|| {
+            panic!("delivered futures must not synchronize during cleanup")
+        });
+        future.reclaim_in_flight_result();
+    }
+
     #[test]
     fn cleanup_is_noop_for_idle_future() {
         let drops = Arc::new(AtomicUsize::new(0));
