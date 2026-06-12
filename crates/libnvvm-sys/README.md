@@ -18,7 +18,7 @@ None. The library is loaded at runtime, so the CUDA Toolkit only needs to be pre
 
 1. `LIBNVVM_PATH` env var, if set.
 2. The system loader (`libnvvm.so.4`, `libnvvm.so.3`, `libnvvm.so`).
-3. `<root>/nvvm/lib64/libnvvm.so` for `<root>` in `CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda`, `/opt/cuda`.
+3. `<root>/nvvm/lib64/libnvvm.so` for `<root>` in `CUDA_TOOLKIT_PATH`, `CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda`, `/opt/cuda`.
 
 libNVVM ships with the standard CUDA Toolkit at `<cuda>/nvvm/lib64/`. No separate download.
 

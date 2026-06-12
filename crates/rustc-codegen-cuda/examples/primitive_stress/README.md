@@ -49,4 +49,5 @@ Toolkit installed.
 selects the GPU arch; otherwise it defaults to `sm_120`.
 `CUDA_OXIDE_LIBDEVICE`, `LIBNVVM_PATH`, and `LIBNVJITLINK_PATH` override
 the corresponding discovery searches; without them the helper probes
-`CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda`, and `/opt/cuda`.
+`CUDA_TOOLKIT_PATH`, `CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda`, and
+`/opt/cuda`.

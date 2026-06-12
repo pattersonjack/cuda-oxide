@@ -109,7 +109,7 @@ pub enum NvJitLinkError {
     /// `libnvJitLink.so` could not be located on this system. `tried` lists
     /// every path or SONAME that was probed, in order, joined by newlines.
     #[error(
-        "libnvJitLink.so could not be located. Set LIBNVJITLINK_PATH or CUDA_HOME, or install the CUDA Toolkit. Tried:\n  {tried}"
+        "libnvJitLink.so could not be located. Set LIBNVJITLINK_PATH, CUDA_TOOLKIT_PATH, or CUDA_HOME, or install the CUDA Toolkit. Tried:\n  {tried}"
     )]
     LibraryNotFound {
         /// Newline-joined list of paths and SONAMEs that were probed.

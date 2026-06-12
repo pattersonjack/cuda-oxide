@@ -18,8 +18,8 @@
 //! [`LibNvvm::load`] tries (in order):
 //! 1. `LIBNVVM_PATH` env var, if set.
 //! 2. The system loader (`libnvvm.so.4`, `libnvvm.so.3`, `libnvvm.so`).
-//! 3. `<root>/nvvm/lib64/libnvvm.so` for `<root>` in `CUDA_HOME`,
-//!    `CUDA_PATH`, `/usr/local/cuda`, `/opt/cuda`.
+//! 3. `<root>/nvvm/lib64/libnvvm.so` for `<root>` in `CUDA_TOOLKIT_PATH`,
+//!    `CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda`, `/opt/cuda`.
 //!
 //! # Symbol naming
 //!
@@ -81,7 +81,7 @@ pub enum NvvmError {
     /// `libnvvm.so` could not be located on this system. `tried` lists every
     /// path or SONAME that was probed, in order, joined by newlines.
     #[error(
-        "libnvvm.so could not be located. Set LIBNVVM_PATH or CUDA_HOME, or install the CUDA Toolkit. Tried:\n  {tried}"
+        "libnvvm.so could not be located. Set LIBNVVM_PATH, CUDA_TOOLKIT_PATH, or CUDA_HOME, or install the CUDA Toolkit. Tried:\n  {tried}"
     )]
     LibraryNotFound {
         /// Newline-joined list of paths and SONAMEs that were probed.
