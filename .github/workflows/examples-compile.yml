@@ -80,19 +80,6 @@ jobs:
           export LIBRARY_PATH="${sysroot}/lib:${LIBRARY_PATH:-}"
           export LD_LIBRARY_PATH="${sysroot}/lib:${LD_LIBRARY_PATH:-}"
 
-          # cargo-oxide itself links libcuda (it can query the GPU arch in
-          # `run` mode), so its DT_NEEDED carries libcuda.so.1. The dev
-          # sub-packages only ship the link-time stub named libcuda.so;
-          # shadow it under the soname so the binary loads on a GPU-less
-          # runner. Compile-only never makes a real driver call. Same
-          # trick as unit-tests.yml.
-          if [ -f "${CUDA_TOOLKIT_PATH}/lib64/stubs/libcuda.so" ]; then
-            stub_shadow="${RUNNER_TEMP}/libcuda-stub"
-            mkdir -p "${stub_shadow}"
-            ln -sf "${CUDA_TOOLKIT_PATH}/lib64/stubs/libcuda.so" "${stub_shadow}/libcuda.so.1"
-            export LD_LIBRARY_PATH="${stub_shadow}:${LD_LIBRARY_PATH}"
-          fi
-
           scripts/smoketest.sh --compile-only --no-color
 
       - name: Upload failure logs

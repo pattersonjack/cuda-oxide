@@ -177,21 +177,30 @@ cargo oxide doctor
 
 Doctor checks:
 
-| Check           | What it verifies                                                              |
-|:----------------|:------------------------------------------------------------------------------|
-| Rust toolchain  | Nightly compiler with required components                                     |
-| CUDA toolkit    | `nvcc` found and version compatible                                           |
-| libNVVM         | `libnvvm.so` (CUDA Toolkit) loadable -- needed for libdevice math kernels     |
-| nvJitLink       | `libnvJitLink.so` (CUDA Toolkit) loadable -- needed for libdevice math kernels|
-| libdevice       | `libdevice.10.bc` discoverable -- needed for libdevice math kernels           |
-| LLVM            | `llc` (21+) available for PTX generation                                      |
-| Codegen backend | `librustc_codegen_cuda.so` found (run `cargo oxide setup` to build it)        |
+| Check           | What it verifies                               |
+|:----------------|:-----------------------------------------------|
+| Rust toolchain  | Nightly compiler with required components      |
+| Codegen backend | `librustc_codegen_cuda.so` built               |
+| CUDA headers    | `cuda.h` present under the toolkit root        |
+| CUDA toolkit    | `nvcc` found and version compatible            |
+| libNVVM         | `libnvvm.so` loadable (libdevice math kernels) |
+| nvJitLink       | `libnvJitLink.so` loadable (same)              |
+| libdevice       | `libdevice.10.bc` discoverable (same)          |
+| LLVM            | `llc` (21+) available for PTX generation       |
+| Driver / GPU    | `nvidia-smi` reports a GPU and its compute cap |
 
 The libNVVM / nvJitLink / libdevice checks fire only when a kernel calls
 CUDA libdevice math (`sin`, `cos`, `exp`, `pow`, `sqrt`, ...). If your
 kernel is pure arithmetic, those three failing is harmless. They all ship
 with the CUDA Toolkit -- no separate download. If any check fails, doctor
 prints the standard install location for that component.
+
+Doctor itself needs neither the CUDA toolkit nor a driver, and it never
+builds anything first, so it works on a machine where nothing is installed
+yet. Two checks are informational rather than fatal: the codegen backend (a
+missing `.so` just means "run `cargo oxide setup`"; `run`/`build` build it
+on demand anyway) and the driver / GPU check (only `cargo oxide run` needs
+a GPU; `build` and `pipeline` work without one).
 
 ## `cargo oxide pipeline` -- inspecting the compilation
 

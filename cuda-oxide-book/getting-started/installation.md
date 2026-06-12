@@ -229,7 +229,16 @@ Run the built-in diagnostics check:
 cargo oxide doctor
 ```
 
-`cargo oxide doctor` validates your Rust toolchain, CUDA toolkit (including libNVVM / nvJitLink / libdevice for kernels that use math intrinsics), LLVM installation, and codegen backend in one shot.
+`cargo oxide doctor` validates your Rust toolchain, CUDA headers (`cuda.h`),
+CUDA toolkit (including libNVVM / nvJitLink / libdevice for kernels that use
+math intrinsics), LLVM installation, NVIDIA driver / GPU, and codegen backend
+in one shot.
+
+`cargo-oxide` itself does not need the CUDA toolkit or an NVIDIA driver to
+build and run, so `doctor` works even on a machine where nothing is installed
+yet and diagnoses exactly what is missing (for example missing `cuda.h`, or
+no driver). The driver / GPU check is informational: only `cargo oxide run`
+needs a GPU, while `build` and `pipeline` work without one.
 
 Then build and run an example end-to-end:
 

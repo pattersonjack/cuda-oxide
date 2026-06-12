@@ -113,7 +113,17 @@ Formats all crates in the workspace: root workspace, `rustc-codegen-cuda`, and a
 
 ### `cargo oxide doctor`
 
-Validates that your environment is correctly set up: Rust nightly toolchain, CUDA toolkit (`nvcc`), LLVM (`llc`), and the codegen backend `.so`.
+Validates that your environment is correctly set up: Rust nightly toolchain,
+CUDA headers (`cuda.h`), CUDA toolkit (`nvcc`, libNVVM, nvJitLink,
+libdevice), LLVM (`llc`), clang/libclang, the NVIDIA driver / GPU, and the
+codegen backend `.so`. Every check reports what was found or how to fix it.
+
+`cargo-oxide` itself builds and runs without the CUDA toolkit and without an
+NVIDIA driver, and `doctor` never builds anything first, so it works on a
+bare machine and tells you exactly what is missing. The driver / GPU check is
+informational (only `cargo oxide run` needs a GPU), and a missing backend
+`.so` just points at `cargo oxide setup` (`run`/`build` build it on demand
+anyway).
 
 ### `cargo oxide setup`
 

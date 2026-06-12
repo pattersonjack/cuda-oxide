@@ -52,9 +52,10 @@ jobs:
           # pure-Rust kernel-launch helpers + tcgen05 tiling tables
           - package: cuda-host
             needs_cuda: true
-          # cargo subcommand wrapper; transitively pulls cuda-bindings
+          # cargo subcommand wrapper; pure Rust, no CUDA toolkit required.
+          # Running it on a runner with NO toolkit installed is the
+          # regression gate for issue #87.
           - package: cargo-oxide
-            needs_cuda: true
           # async DeviceOperation pipeline; transitively pulls cuda-bindings
           - package: cuda-async
             needs_cuda: true
@@ -106,3 +107,15 @@ jobs:
           fi
 
           cargo test -p ${{ matrix.package }} ${{ matrix.test_args || '--all-targets' }}
+
+      # End-to-end proof for issue #87: on this runner there is no CUDA
+      # toolkit and no driver, yet doctor must build, load, and reach its
+      # checks (it exits 1 here because nvcc/cuda.h are missing, which is
+      # exactly the diagnosis it exists to print).
+      - name: cargo oxide doctor reaches its checks without the CUDA toolkit
+        if: matrix.package == 'cargo-oxide'
+        run: |
+          set -uo pipefail
+          out="$(cargo run -p cargo-oxide -- doctor 2>&1)" || true
+          printf '%s\n' "${out}"
+          printf '%s\n' "${out}" | grep -q "CUDA headers (cuda.h)"

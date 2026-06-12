@@ -210,7 +210,9 @@ fn main() {
             commands::scaffold_new(&name, async_mode);
         }
         Commands::Doctor => {
-            let ctx = commands::resolve_context();
+            // Side-effect-free resolver: doctor must never build the backend
+            // (or clone anything) before it can diagnose the environment.
+            let ctx = commands::resolve_doctor_context();
             commands::doctor(&ctx);
         }
         Commands::Setup => {
