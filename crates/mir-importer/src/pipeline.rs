@@ -110,6 +110,7 @@ impl llvm_export::export::AsDeviceExtern for DeviceExternDecl {
         }
     }
 }
+use crate::llvm_tools::LlvmToolchain;
 use pliron::builtin::op_interfaces::{CallOpCallable, CallOpInterface, SymbolOpInterface};
 use pliron::context::{Context, Ptr};
 use pliron::identifier::Legaliser;
@@ -117,7 +118,7 @@ use pliron::linked_list::ContainsLinkedList;
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::printable::Printable;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Device artifact format produced by a successful pipeline run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -531,8 +532,11 @@ fn append_to_module(ctx: &Context, module_op_ptr: Ptr<Operation>, func_op_ptr: P
 fn lower_to_llvm(ctx: &mut Context, module_op_ptr: Ptr<Operation>) -> Result<(), PipelineError> {
     mir_lower::register(ctx);
 
-    mir_lower::lower_mir_to_llvm(ctx, module_op_ptr)
-        .map_err(|e| PipelineError::Lowering(e.to_string()))
+    match mir_lower::lower_mir_to_llvm(ctx, module_op_ptr) {
+        Ok(()) => Ok(()),
+        // Format with `ctx` so the failing op's location/span survives.
+        Err(e) => Err(PipelineError::Lowering(e.disp(ctx).to_string())),
+    }
 }
 
 /// Adds device extern function declarations to the LLVM dialect module.
@@ -780,6 +784,44 @@ fn select_target(features: DetectedFeatures) -> &'static str {
     }
 }
 
+/// Does `arch` (e.g. `"sm_120a"`, `"sm_90"`) support the kernel's detected
+/// features?
+///
+/// tcgen05/TMEM and `cta_group` TMA multicast exist only in the sm_100
+/// datacenter-Blackwell family: consumer Blackwell (sm_120) and Hopper (sm_90)
+/// lack them, so an sm_120 GPU cannot run an sm_100 tcgen05 kernel even though
+/// 120 > 100. WGMMA is Hopper-only. The remaining features are forward
+/// compatible from their floor (TMA / cluster need sm_90+, basic needs sm_80+).
+///
+/// Used to decide whether the GPU in this machine (the `CUDA_OXIDE_DEVICE_ARCH`
+/// hint) can actually run the kernel, or whether we must build for the arch the
+/// IR requires instead.
+fn arch_satisfies(arch: &str, features: DetectedFeatures) -> bool {
+    let Some(major) = arch_major(arch) else {
+        return false;
+    };
+    match features {
+        DetectedFeatures::Blackwell | DetectedFeatures::TmaMulticast => major == 10,
+        DetectedFeatures::Wgmma => major == 9,
+        DetectedFeatures::Tma | DetectedFeatures::Cluster => major >= 9,
+        DetectedFeatures::Basic => major >= 8,
+    }
+}
+
+/// Extract the compute-capability *major* version from an `sm_…` target string.
+///
+/// CUDA concatenates major+minor without a separator, so `"sm_120a"` is cc 12.0
+/// (major 12), `"sm_90"` is cc 9.0, `"sm_103a"` is cc 10.3. We read the digit
+/// run after `sm_` and divide by ten. Returns `None` when there are no digits.
+fn arch_major(arch: &str) -> Option<u32> {
+    let digits: String = arch
+        .trim_start_matches("sm_")
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse::<u32>().ok().map(|n| n / 10)
+}
+
 /// Runs LLVM's middle-end (`opt -O2`) on the emitted IR before `llc`.
 ///
 /// This is what consumes the per-op ABI alignment we emit: the
@@ -788,72 +830,52 @@ fn select_target(features: DetectedFeatures) -> &'static str {
 /// pointers to `.global` (LDG/STG). Gated on alignment — fusion only fires
 /// when loads/stores carry matching `align N` hints.
 ///
-/// Set `CUDA_OXIDE_NO_OPT=1` to skip and feed the unoptimised IR straight to
-/// `llc`. Returns the optimised `.ll` path, or `None` if opt is disabled or
-/// unavailable (caller falls back to the original `ll_path`).
-fn optimize_ll(ll_path: &Path, verbose: bool) -> Option<std::path::PathBuf> {
-    if std::env::var("CUDA_OXIDE_NO_OPT").is_ok() {
-        return None;
-    }
-
-    let mut candidates: Vec<String> = Vec::new();
-    if let Ok(p) = std::env::var("CUDA_OXIDE_OPT") {
-        candidates.push(p);
-    }
-    if let Some(p) = std::process::Command::new("rustc")
-        .args(["--print", "sysroot", "--print", "host-tuple"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .split('\n')
-                .zip([["lib", "rustlib"], ["bin", "opt"]])
-                .flat_map(|(a, b)| [a].into_iter().chain(b))
-                .collect::<std::path::PathBuf>()
-                .to_str()
-                .map(str::to_string)
-        })
-    {
-        candidates.push(p);
-    }
-    for name in ["opt-22", "opt-21", "opt"] {
-        candidates.push(name.to_string());
-    }
+/// The `opt` binary comes from the resolved [`LlvmToolchain`], which
+/// guarantees it shares the LLVM major of the `llc` that will consume its
+/// output (issue #150: an LLVM 22 `opt` emits sizeless
+/// `llvm.lifetime.start/end` intrinsics that an LLVM 21 `llc` rejects).
+///
+/// Returns the optimised `.ll` path, or `None` when the middle-end is off
+/// (`CUDA_OXIDE_NO_OPT=1`), no same-major `opt` exists, or the chosen `opt`
+/// fails at runtime; the caller then feeds the unoptimised `ll_path` to
+/// `llc`, which is always safe.
+fn optimize_ll(ll_path: &Path, toolchain: &LlvmToolchain, verbose: bool) -> Option<PathBuf> {
+    let opt = toolchain.opt.as_ref()?;
 
     let opt_ll = ll_path.with_extension("opt.ll");
-    for opt_cmd in candidates {
-        match std::process::Command::new(&opt_cmd)
-            .arg("-O2")
-            .arg(ll_path)
-            .arg("-S")
-            .arg("-o")
-            .arg(&opt_ll)
-            .output()
-        {
-            Ok(o) if o.status.success() => {
-                if verbose {
-                    eprintln!("opt -O2 via {opt_cmd}: {}", opt_ll.display());
-                }
-                return Some(opt_ll);
+    match std::process::Command::new(&opt.path)
+        .arg("-O2")
+        .arg(ll_path)
+        .arg("-S")
+        .arg("-o")
+        .arg(&opt_ll)
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            if verbose {
+                eprintln!("opt -O2 via {}: {}", opt.path, opt_ll.display());
             }
-            Ok(o) => {
-                if verbose {
-                    eprintln!(
-                        "opt ({opt_cmd}) failed: {}",
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    );
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                if verbose {
-                    eprintln!("opt ({opt_cmd}): {e}");
-                }
-            }
+            Some(opt_ll)
+        }
+        Ok(o) => {
+            // The matched opt exists but rejected the input. Warn loudly
+            // (there is no second candidate any more) and fall back to
+            // unoptimised IR rather than to a different LLVM major.
+            eprintln!(
+                "warning: opt ({}) failed; continuing with unoptimised IR:\n{}",
+                opt.path,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: opt ({}): {e}; continuing with unoptimised IR",
+                opt.path
+            );
+            None
         }
     }
-    None
 }
 
 /// Generates PTX from LLVM IR using `llc`.
@@ -865,11 +887,21 @@ fn optimize_ll(ll_path: &Path, verbose: bool) -> Option<std::path::PathBuf> {
 /// group parameter requires LLVM 21). If `CUDA_OXIDE_LLC` is set, it is used
 /// exclusively — power users can point this at an older `llc` at their own
 /// risk (most examples will still compile but modern intrinsics will not).
-/// Auto-detects GPU features to select target, or uses `CUDA_OXIDE_TARGET`
-/// if set.
+///
+/// `opt` and `llc` are resolved together via [`LlvmToolchain`] so the
+/// middle-end never runs under a different LLVM major than the backend
+/// (issue #150).
+///
+/// Target arch resolves (highest priority first) to: an explicit
+/// `CUDA_OXIDE_TARGET` override, else the detected-GPU hint
+/// (`CUDA_OXIDE_DEVICE_ARCH`) when that GPU can run the kernel, else the minimum
+/// arch the IR's features require (`select_target`).
 fn generate_ptx(ll_path: &Path, ptx_path: &Path) -> Result<String, PipelineError> {
-    // Check for user-specified target override
-    let target_override = std::env::var("CUDA_OXIDE_TARGET").ok();
+    // Explicit, hard override: `--arch` or a parent-set `CUDA_OXIDE_TARGET`.
+    let explicit_override = std::env::var("CUDA_OXIDE_TARGET").ok();
+    // Advisory hint: the arch of the GPU in this machine, forwarded by
+    // `cargo oxide run`. Used only when that GPU can actually run the kernel.
+    let device_hint = std::env::var("CUDA_OXIDE_DEVICE_ARCH").ok();
 
     // Detect features (order matters: most specific first)
     let detected = match (
@@ -887,139 +919,104 @@ fn generate_ptx(ll_path: &Path, ptx_path: &Path) -> Result<String, PipelineError
         _ => DetectedFeatures::Basic,
     };
 
-    // Use override if provided, otherwise auto-detect
-    let target = match &target_override {
-        Some(t) => t.as_str(),
-        None => select_target(detected),
+    // Arch the IR actually requires (the hard floor).
+    let feature_arch = select_target(detected);
+
+    // Resolve the final target:
+    //   1. explicit override -- honored as-is. If it cannot lower the kernel's
+    //      features we warn (otherwise llc aborts with a cryptic backend error).
+    //   2. detected-device hint -- used only if that GPU can run the kernel;
+    //      otherwise we build for `feature_arch`. The resulting PTX will not
+    //      load on this GPU, but feature-gated examples handle that at load time
+    //      (cuModuleLoad reports INVALID_PTX and they skip execution).
+    //   3. neither set -- the feature floor.
+    let (target, target_source): (String, &str) = if let Some(t) = explicit_override {
+        if !arch_satisfies(&t, detected) {
+            eprintln!(
+                "warning: CUDA_OXIDE_TARGET={t} cannot lower the detected feature \
+                 {detected:?} (needs {feature_arch}); PTX generation will likely \
+                 fail. Unset CUDA_OXIDE_TARGET to let cuda-oxide select \
+                 {feature_arch} automatically."
+            );
+        }
+        (t, "CUDA_OXIDE_TARGET")
+    } else if let Some(dev) = device_hint.filter(|d| arch_satisfies(d, detected)) {
+        (dev, "detected GPU")
+    } else {
+        (feature_arch.to_string(), "feature requirement")
     };
 
     // Log target selection
     if std::env::var("CUDA_OXIDE_VERBOSE").is_ok() {
-        match &target_override {
-            Some(_) => eprintln!("Target: {} (from CUDA_OXIDE_TARGET)", target),
-            None => eprintln!("Target: {} (auto-detected: {:?})", target, detected),
-        }
+        eprintln!("Target: {target} (from {target_source}; detected {detected:?})");
     }
 
     let verbose = std::env::var("CUDA_OXIDE_VERBOSE").is_ok();
 
-    // Run the middle-end (opt -O2) before llc. Feature detection above
-    // intentionally reads the original (pre-opt) IR so the target is
-    // determined by what the source actually needs, not what opt elides.
-    let optimized = optimize_ll(ll_path, verbose);
-    let llc_input: &Path = optimized.as_deref().unwrap_or(ll_path);
-
-    // Check for user-specified llc path override
-    if let Ok(llc_path) = std::env::var("CUDA_OXIDE_LLC") {
-        if verbose {
-            eprintln!("Using llc: {} (from CUDA_OXIDE_LLC)", llc_path);
-        }
-        let result = std::process::Command::new(&llc_path)
-            .arg("-march=nvptx64")
-            .arg(format!("-mcpu={}", target))
-            .arg(llc_input)
-            .arg("-o")
-            .arg(ptx_path)
-            .output();
-
-        return match result {
-            Ok(output) if output.status.success() => Ok(target.to_string()),
-            Ok(output) => Err(PipelineError::PtxGeneration(format!(
-                "CUDA_OXIDE_LLC={} failed:\n{}",
-                llc_path,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))),
-            Err(e) => Err(PipelineError::PtxGeneration(format!(
-                "CUDA_OXIDE_LLC={}: {}",
-                llc_path, e
-            ))),
-        };
-    }
-
-    let llc_path = std::process::Command::new("rustc")
-        .arg("--print")
-        .arg("sysroot")
-        .arg("--print")
-        .arg("host-tuple")
-        .output()
-        .ok()
-        .and_then(|output| {
-            if output.status.success() {
-                String::from_utf8_lossy(&output.stdout)
-                    .split('\n')
-                    .zip([["lib", "rustlib"], ["bin", "llc"]])
-                    .flat_map(|(a, b)| [a].into_iter().chain(b))
-                    .collect::<std::path::PathBuf>()
-                    .to_str()
-                    .map(|i| i.to_string())
-            } else {
-                None
-            }
-        });
-
-    // Try different llc versions (newest first for best atomics/scope support).
-    //
-    // LLVM 21 is the floor: older releases reject modern TMA / tcgen05 /
-    // WGMMA intrinsic signatures that cuda-oxide emits. Users on older
-    // distros can opt in to a specific `llc` via `CUDA_OXIDE_LLC`.
-    //
-    // Target reference:
-    //   - sm_100a: Blackwell datacenter (tcgen05/TMEM)
-    //   - sm_90a:  Hopper only (WGMMA + TMA) - NOT forward-compatible
-    //   - sm_120:  Blackwell consumer (TMA with PTX 8.7)
-    //   - sm_80:   Ampere+ (maximum compatibility)
-    let llc_candidates = [("llc-22", target), ("llc-21", target)];
-
-    let mut last_error = String::new();
-
-    for (llc_cmd, llc_target) in llc_path
-        .as_deref()
-        .map(|s| (s, target))
-        .into_iter()
-        .chain(llc_candidates)
-    {
-        let result = std::process::Command::new(llc_cmd)
-            .arg("-march=nvptx64")
-            .arg(format!("-mcpu={}", llc_target))
-            .arg(llc_input)
-            .arg("-o")
-            .arg(ptx_path)
-            .output();
-
-        match result {
-            Ok(output) if output.status.success() => {
-                if verbose {
-                    eprintln!("Using llc: {} (auto-detected)", llc_cmd);
-                }
-                return Ok(llc_target.to_string());
-            }
-            Ok(output) => {
-                // llc ran but failed - capture the error
-                last_error = String::from_utf8_lossy(&output.stderr).to_string();
-            }
-            Err(e) => match e.kind() {
-                std::io::ErrorKind::NotFound => continue,
-                _ => last_error = format!("{}: {}", llc_cmd, e),
-            },
-        }
-    }
-
-    match last_error.is_empty() {
-        true => Err(PipelineError::PtxGeneration(
+    // Resolve `opt` and `llc` as a matched pair (issue #150): llc first
+    // (CUDA_OXIDE_LLC, then the Rust toolchain's llvm-tools llc, then
+    // llc-22 / llc-21 on PATH — newest first for best atomics/scope
+    // support), then an opt of the same LLVM major. LLVM 21 is the floor:
+    // older releases reject modern TMA / tcgen05 / WGMMA intrinsic
+    // signatures that cuda-oxide emits. Users on older distros can opt in
+    // to a specific `llc` via `CUDA_OXIDE_LLC`.
+    let Some(toolchain) = LlvmToolchain::resolve(verbose) else {
+        return Err(PipelineError::PtxGeneration(
             "No working llc found.\n\
              cuda-oxide tries (in order): CUDA_OXIDE_LLC, the Rust toolchain's \
-             llvm-tools llc, then llc-22 / llc-21 / llc on PATH. \
+             llvm-tools llc, then llc-22 / llc-21 on PATH. \
              LLVM 21+ is required (earlier versions reject the TMA / tcgen05 / \
              WGMMA intrinsic signatures we emit).\n\
              Easiest fix: `rustup component add llvm-tools` (auto-picked up).\n\
              Alternative: `sudo apt install llvm-21` (or `llvm-22`).\n\
              Or set CUDA_OXIDE_LLC=/path/to/llc to use a specific binary."
                 .to_string(),
-        )),
-        false => Err(PipelineError::PtxGeneration(format!(
-            "llc failed:\n{}",
-            last_error.trim()
+        ));
+    };
+
+    // Run the middle-end (opt -O2) before llc. Feature detection above
+    // intentionally reads the original (pre-opt) IR so the target is
+    // determined by what the source actually needs, not what opt elides.
+    let optimized = optimize_ll(ll_path, &toolchain, verbose);
+    let llc_input: &Path = optimized.as_deref().unwrap_or(ll_path);
+
+    // Target reference:
+    //   - sm_100a: Blackwell datacenter (tcgen05/TMEM)
+    //   - sm_90a:  Hopper only (WGMMA + TMA) - NOT forward-compatible
+    //   - sm_120:  Blackwell consumer (TMA with PTX 8.7)
+    //   - sm_80:   Ampere+ (maximum compatibility)
+    if verbose {
+        let source = if toolchain.llc_from_env {
+            "from CUDA_OXIDE_LLC"
+        } else {
+            "auto-detected"
+        };
+        eprintln!("Using llc: {} ({source})", toolchain.llc_description());
+    }
+    // How to name the llc in errors: keep the env var visible when it was
+    // the source so users connect the failure to their own pin.
+    let llc_desc = if toolchain.llc_from_env {
+        format!("CUDA_OXIDE_LLC={}", toolchain.llc_path)
+    } else {
+        format!("llc ({})", toolchain.llc_path)
+    };
+
+    let result = std::process::Command::new(&toolchain.llc_path)
+        .arg("-march=nvptx64")
+        .arg(format!("-mcpu={}", target))
+        .arg(llc_input)
+        .arg("-o")
+        .arg(ptx_path)
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => Ok(target.to_string()),
+        Ok(output) => Err(PipelineError::PtxGeneration(format!(
+            "{} failed:\n{}",
+            llc_desc,
+            String::from_utf8_lossy(&output.stderr).trim()
         ))),
+        Err(e) => Err(PipelineError::PtxGeneration(format!("{llc_desc}: {e}"))),
     }
 }
 
@@ -1196,6 +1193,57 @@ mod tests {
         assert_eq!(select_target(DetectedFeatures::Tma), "sm_100");
         assert_eq!(select_target(DetectedFeatures::Cluster), "sm_90");
         assert_eq!(select_target(DetectedFeatures::Basic), "sm_80");
+    }
+
+    #[test]
+    fn test_arch_major_parses_cuda_spelling() {
+        assert_eq!(arch_major("sm_75"), Some(7));
+        assert_eq!(arch_major("sm_80"), Some(8));
+        assert_eq!(arch_major("sm_90a"), Some(9));
+        assert_eq!(arch_major("sm_100a"), Some(10));
+        assert_eq!(arch_major("sm_103a"), Some(10));
+        assert_eq!(arch_major("sm_120a"), Some(12));
+        assert_eq!(arch_major("nvvm-ir"), None);
+        assert_eq!(arch_major("sm_"), None);
+    }
+
+    #[test]
+    fn test_arch_satisfies_sm100_only_features() {
+        // tcgen05 and cta_group TMA multicast are sm_100-family only:
+        // consumer Blackwell (sm_120) and Hopper (sm_90) cannot run them, even
+        // though 120 > 100. This is the gemm_sol regression guard.
+        for f in [DetectedFeatures::Blackwell, DetectedFeatures::TmaMulticast] {
+            assert!(arch_satisfies("sm_100a", f), "sm_100a must satisfy {f:?}");
+            assert!(
+                !arch_satisfies("sm_120a", f),
+                "sm_120a must NOT satisfy {f:?}"
+            );
+            assert!(
+                !arch_satisfies("sm_90a", f),
+                "sm_90a must NOT satisfy {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_arch_satisfies_wgmma_is_hopper_only() {
+        assert!(arch_satisfies("sm_90a", DetectedFeatures::Wgmma));
+        assert!(!arch_satisfies("sm_100a", DetectedFeatures::Wgmma));
+        assert!(!arch_satisfies("sm_120a", DetectedFeatures::Wgmma));
+    }
+
+    #[test]
+    fn test_arch_satisfies_forward_compatible_features() {
+        // Plain TMA / cluster lower on any sm_90+ device; basic on any sm_80+.
+        // So a consumer sm_120 GPU is a valid target for these (it runs locally
+        // instead of being downgraded to the feature floor).
+        for arch in ["sm_90a", "sm_100a", "sm_120a"] {
+            assert!(arch_satisfies(arch, DetectedFeatures::Tma));
+            assert!(arch_satisfies(arch, DetectedFeatures::Cluster));
+            assert!(arch_satisfies(arch, DetectedFeatures::Basic));
+        }
+        assert!(arch_satisfies("sm_80", DetectedFeatures::Basic));
+        assert!(!arch_satisfies("sm_80", DetectedFeatures::Tma));
     }
 
     /// Build a minimal LLVM dialect module containing a single function
