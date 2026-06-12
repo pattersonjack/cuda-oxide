@@ -164,6 +164,23 @@ impl<T: Send + 'static, DO: DeviceOperation<Output = T>> DeviceFuture<T, DO> {
         Ok(())
     }
 
+    /// Returns `true` when GPU work was submitted but the stored result has
+    /// not been handed to the caller.
+    ///
+    /// `result` is only populated by a successful [`execute`], so a stored
+    /// result implies submitted GPU work. The state check excludes futures
+    /// that never submitted anything (`Idle`, `Failed`); a `Complete` future
+    /// can still hold a result when callback registration failed after a
+    /// successful launch.
+    ///
+    /// [`execute`]: Self::execute
+    fn has_undelivered_submission(&self) -> bool {
+        matches!(
+            self.state,
+            DeviceFutureState::Executing | DeviceFutureState::Complete
+        ) && self.result.is_some()
+    }
+
     /// Hands a submitted-but-undelivered result to deferred reclamation.
     ///
     /// Records a completion event on the assigned stream and parks the
@@ -175,7 +192,7 @@ impl<T: Send + 'static, DO: DeviceOperation<Output = T>> DeviceFuture<T, DO> {
     ///
     /// [`cleanup_executing_result_with`]: Self::cleanup_executing_result_with
     fn reclaim_in_flight_result(&mut self) {
-        if self.state != DeviceFutureState::Executing || self.result.is_none() {
+        if !self.has_undelivered_submission() {
             return;
         }
         let stream = self
@@ -213,7 +230,7 @@ impl<T: Send + 'static, DO: DeviceOperation<Output = T>> DeviceFuture<T, DO> {
     where
         F: FnOnce() -> Result<(), DeviceError>,
     {
-        if self.state != DeviceFutureState::Executing {
+        if !self.has_undelivered_submission() {
             return;
         }
 
@@ -307,6 +324,12 @@ impl<T: Send + 'static, DO: DeviceOperation<Output = T>> Future for DeviceFuture
                 }
                 if let Err(e) = unsafe { self.register_callback(Arc::clone(&waker_state)) } {
                     self.state = DeviceFutureState::Complete;
+                    // The launch already succeeded, so GPU work is in flight
+                    // and `result` holds the owned resources. Route them
+                    // through deferred reclamation instead of leaving them
+                    // for an immediate drop while the kernel may still run
+                    // (issue #99, callback-registration-failure path).
+                    self.reclaim_in_flight_result();
                     return Poll::Ready(Err(e));
                 }
                 self.state = DeviceFutureState::Executing;
