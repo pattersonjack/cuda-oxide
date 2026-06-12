@@ -199,78 +199,6 @@ impl<T> DeviceBuffer<T> {
     }
 }
 
-/// RAII guard that calls [`crate::memory::free_sync`] on a raw device
-/// pointer unless it has been explicitly disarmed.
-///
-/// # Why this exists
-///
-/// [`DeviceBuffer::from_host`] and [`DeviceBuffer::zeroed`] follow a two-step
-/// pattern:
-///
-/// 1. Allocate device memory with `malloc_sync` — succeeds, returning a raw
-///    `CUdeviceptr`.
-/// 2. Enqueue an async operation (`memcpy_htod_async` or `memset_d8_async`) —
-///    may fail.
-///
-/// Before this guard existed, a failure at step 2 caused an early `?` return
-/// that discarded the raw pointer without freeing the allocation. The
-/// `DeviceBuffer` struct was never fully constructed, so its `Drop` impl never
-/// ran, and the GPU memory was permanently leaked for the lifetime of the CUDA
-/// context.
-///
-/// By wrapping the pointer in `DevicePtrGuard` immediately after `malloc_sync`,
-/// we guarantee that `cuMemFree` is always called on early exit. Once all
-/// fallible steps succeed, [`DevicePtrGuard::disarm`] transfers ownership to
-/// the newly constructed `DeviceBuffer` (which then owns the pointer and will
-/// free it in its own `Drop`).
-struct DevicePtrGuard {
-    ptr: CUdeviceptr,
-    ctx: Arc<CudaContext>,
-    /// When `true` (the initial state), `Drop` will call `free_sync`.
-    /// Set to `false` by [`Self::disarm`] to skip deallocation.
-    armed: bool,
-}
-
-impl DevicePtrGuard {
-    /// Creates an armed guard for `ptr`. The guard will free `ptr` via
-    /// `free_sync` on drop unless [`Self::disarm`] is called first.
-    ///
-    /// `ctx` is needed to bind the correct CUDA context before the free,
-    /// mirroring the same pattern used in `Drop for DeviceBuffer<T>`.
-    fn new(ptr: CUdeviceptr, ctx: Arc<CudaContext>) -> Self {
-        Self {
-            ptr,
-            ctx,
-            armed: true,
-        }
-    }
-
-    /// Disarms the guard so that `ptr` is **not** freed on drop.
-    ///
-    /// Call this after all fallible steps have succeeded and ownership of `ptr`
-    /// has transferred to a `DeviceBuffer` (or another owning type).
-    /// [`std::mem::forget`] is used to skip the `Drop` impl entirely, so
-    /// `cuMemFree` is never called.
-    fn disarm(self) {
-        std::mem::forget(self);
-    }
-}
-
-impl Drop for DevicePtrGuard {
-    /// Frees the guarded pointer if the guard is still armed.
-    ///
-    /// Mirrors the logic in `Drop for DeviceBuffer<T>`: bind the owning
-    /// context to the current thread before freeing, and record rather than
-    /// panic on any driver error (since `Drop` cannot return `Result`).
-    fn drop(&mut self) {
-        if self.armed && self.ptr != 0 {
-            self.ctx.record_err(self.ctx.bind_to_thread());
-            self.ctx
-                .record_err(unsafe { crate::memory::free_sync(self.ptr) });
-        }
-    }
-}
-
 impl<T: DeviceCopy> DeviceBuffer<T> {
     /// Allocates device memory and copies `data` from the host, enqueued on
     /// `stream`.
@@ -282,40 +210,30 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
     ///
     /// # Allocation safety on error
     ///
-    /// If `memcpy_htod_async` fails after `malloc_sync` has already succeeded,
-    /// the allocated device memory is freed before returning the error. This is
-    /// guaranteed by [`DevicePtrGuard`], which is armed immediately after the
-    /// allocation and disarmed only once the `DeviceBuffer` is fully
-    /// constructed.
+    /// The returned buffer takes ownership of the device allocation
+    /// immediately after `malloc_sync`, before the fallible
+    /// `memcpy_htod_async` enqueue runs. If the enqueue fails, the early
+    /// return drops the buffer and its `Drop` impl frees the allocation, so
+    /// no device memory is leaked.
     pub fn from_host(stream: &CudaStream, data: &[T]) -> Result<Self, DriverError> {
         let ctx = stream.context().clone();
         let len = data.len();
         let num_bytes = std::mem::size_of_val(data);
 
-        // Allocate first. If this fails we have nothing to clean up.
         let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
-
-        // Arm the guard immediately so the allocation is freed if any
-        // subsequent step returns an error before the `DeviceBuffer` is
-        // constructed.  Without this, the raw `ptr` (a plain `u64`) would be
-        // silently discarded by the early `?` return, leaking GPU memory.
-        let guard = DevicePtrGuard::new(ptr, ctx.clone());
-
+        // SAFETY: `ptr` was just allocated with `num_bytes` bytes in the
+        // stream's context; ownership transfers to `buf` here so any early
+        // return below frees it through the buffer's own `Drop`.
+        let buf = unsafe { Self::from_raw_parts(ptr, len, ctx) };
         unsafe {
-            crate::memory::memcpy_htod_async(ptr, data.as_ptr(), num_bytes, stream.cu_stream())?;
+            crate::memory::memcpy_htod_async(
+                buf.ptr,
+                data.as_ptr(),
+                num_bytes,
+                stream.cu_stream(),
+            )?;
         }
-
-        // All fallible steps succeeded. Disarm the guard so it does not free
-        // `ptr` on drop — ownership transfers to the `DeviceBuffer` below,
-        // which will free it in its own `Drop` impl.
-        guard.disarm();
-
-        Ok(Self {
-            ptr,
-            len,
-            ctx,
-            _marker: PhantomData,
-        })
+        Ok(buf)
     }
 
     /// Allocates device memory and enqueues a host-to-device copy from a
@@ -362,37 +280,26 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
     ///
     /// # Allocation safety on error
     ///
-    /// If `memset_d8_async` fails after `malloc_sync` has already succeeded,
-    /// the allocated device memory is freed before returning the error.
-    /// See [`DevicePtrGuard`] and the analogous comment on [`Self::from_host`].
+    /// The returned buffer takes ownership of the device allocation
+    /// immediately after `malloc_sync`, before the fallible
+    /// `memset_d8_async` enqueue runs. If the enqueue fails, the early
+    /// return drops the buffer and its `Drop` impl frees the allocation, so
+    /// no device memory is leaked.
     pub fn zeroed(stream: &CudaStream, len: usize) -> Result<Self, DriverError> {
         let ctx = stream.context().clone();
         let num_bytes = len * std::mem::size_of::<T>();
 
-        // Allocate first. If this fails we have nothing to clean up.
         let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
-
-        // Arm the guard for the same reason as in `from_host`: if
-        // `memset_d8_async` returns an error the raw pointer would otherwise
-        // be silently dropped, leaking the device allocation.
-        let guard = DevicePtrGuard::new(ptr, ctx.clone());
-
+        // SAFETY: `ptr` was just allocated with `num_bytes` bytes in the
+        // stream's context; ownership transfers to `buf` here so any early
+        // return below frees it through the buffer's own `Drop`.
+        let buf = unsafe { Self::from_raw_parts(ptr, len, ctx) };
         if num_bytes > 0 {
             unsafe {
-                crate::memory::memset_d8_async(ptr, 0, num_bytes, stream.cu_stream())?;
+                crate::memory::memset_d8_async(buf.ptr, 0, num_bytes, stream.cu_stream())?;
             }
         }
-
-        // All fallible steps succeeded — disarm the guard and hand `ptr` off
-        // to the `DeviceBuffer`.
-        guard.disarm();
-
-        Ok(Self {
-            ptr,
-            len,
-            ctx,
-            _marker: PhantomData,
-        })
+        Ok(buf)
     }
 
     /// Copies the entire buffer back to the host, returning a `Vec<T>`.
