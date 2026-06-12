@@ -1,6 +1,6 @@
 # dialect-nvvm
 
-A [pliron](https://github.com/vaivaswatha/pliron) dialect for NVIDIA GPU intrinsics. These operations represent hardware-specific functionality -- thread indexing, warp shuffles, barriers, tensor memory accelerator, tensor cores -- that maps directly to LLVM NVPTX intrinsics. `mir-lower` generates these ops when lowering `cuda_device` intrinsic calls, and the exporter in `dialect-llvm` emits them as `@llvm.nvvm.*` intrinsic calls.
+A [pliron](https://github.com/vaivaswatha/pliron) dialect for NVIDIA GPU intrinsics. These operations represent hardware-specific functionality -- thread indexing, warp shuffles, barriers, tensor memory accelerator, tensor cores -- that maps directly to LLVM NVPTX intrinsics. `mir-lower` generates these ops when lowering `cuda_device` intrinsic calls, and the `llvm-export` exporter emits them as `@llvm.nvvm.*` intrinsic calls.
 
 ```text
 cuda_device::{thread, barrier, tma, ...}  (user-facing Rust API)
@@ -8,22 +8,22 @@ cuda_device::{thread, barrier, tma, ...}  (user-facing Rust API)
        ▼  (mir-lower recognizes intrinsic calls)
 dialect-nvvm ops
        │
-       ▼  (dialect-llvm export)
+       ▼  (llvm-export emits LLVM IR)
 @llvm.nvvm.* intrinsic calls  →  llc  →  PTX instructions
 ```
 
 ## Operations by GPU Generation
 
-123 operations across 12 modules, spanning three GPU generations:
+124 operations across 12 modules, spanning three GPU generations:
 
 ### Universal (all GPUs)
 
-| Module   | Ops | Highlights                                                                                |
-|----------|-----|-------------------------------------------------------------------------------------------|
-| `thread` | 18  | tid/ctaid/ntid/nctaid for x/y/z, env_reg{1,2}, barrier0, threadfence{,_block,_system}     |
-| `warp`   | 18  | shfl (idx/bfly/down/up, i32 and f32), lane_id, vote (all/any/ballot), match_any/match_all |
-| `grid`   | 1   | grid_sync (cooperative kernel launches only)                                              |
-| `debug`  | 6   | clock/clock64, trap, breakpoint, pm_event, vprintf                                        |
+| Module   | Ops | Highlights                                                                                         |
+|----------|-----|----------------------------------------------------------------------------------------------------|
+| `thread` | 18  | tid/ctaid/ntid/nctaid for x/y/z, env_reg{1,2}, barrier0, threadfence{,_block,_system}              |
+| `warp`   | 18  | shfl (idx/bfly/down/up, i32 and f32), lane_id, vote (all/any/ballot), match_any/match_all          |
+| `grid`   | 1   | grid_sync (cooperative kernel launches only)                                                       |
+| `debug`  | 7   | clock/clock64/globaltimer, trap, breakpoint, pm_event, vprintf                                     |
 
 ### Volta+ (sm_70)
 
@@ -52,11 +52,11 @@ dialect-nvvm ops
 
 Three attributes defined for atomic operations:
 
-| Attribute        | Values                                     |
-|------------------|--------------------------------------------|
-| `AtomicOrdering` | relaxed, acquire, release, acq_rel, seq_cst|
-| `AtomicScope`    | cta, gpu, sys                              |
-| `AtomicRmwKind`  | xchg, add, sub, and, or, xor, max, min     |
+| Attribute        | Values                                      |
+|------------------|---------------------------------------------|
+| `AtomicOrdering` | relaxed, acquire, release, acq_rel, seq_cst |
+| `AtomicScope`    | cta, gpu, sys                               |
+| `AtomicRmwKind`  | xchg, add, sub, and, or, xor, max, min      |
 
 ## Verification
 
@@ -83,7 +83,7 @@ src/
     ├── warp.rs      # Shuffle, vote, match operations
     ├── grid.rs      # Cooperative grid_sync
     ├── atomic.rs    # Atomic ops + ordering/scope/kind attributes
-    ├── debug.rs     # Clock, trap, printf
+    ├── debug.rs     # Clock/timer, trap, printf
     ├── cluster.rs   # Thread block clusters, DSMEM
     ├── mbarrier.rs  # Async barriers for TMA
     ├── tma.rs       # Tensor Memory Accelerator copies
@@ -96,6 +96,6 @@ src/
 ## Further Reading
 
 - [`dialect-mir`](../dialect-mir/) -- pliron dialect modelling Rust MIR (lowering source)
-- [`dialect-llvm`](../dialect-llvm/) -- pliron dialect modelling LLVM IR (lowering target)
+- [`llvm-export`](../llvm-export/) -- pliron-llvm shim + textual `.ll` exporter (lowering target)
 - [`mir-lower`](../mir-lower/) -- generates `dialect-nvvm` ops during lowering
 - [`cuda-device`](../cuda-device/) -- user-facing intrinsics that map to `dialect-nvvm` ops

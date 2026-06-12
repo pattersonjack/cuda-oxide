@@ -34,8 +34,9 @@
 //! - **nvJitLink**: same, but at `<root>/lib64/libnvJitLink.so`.
 //! - **libdevice**: `CUDA_OXIDE_LIBDEVICE` env var, then
 //!   `<root>/nvvm/libdevice/libdevice.10.bc` for the same roots.
-//! - **Arch**: `CUDA_OXIDE_TARGET` env var (set by `cargo oxide`'s
-//!   `--arch=<sm_XX>`), defaulting to `sm_120`.
+//! - **Arch**: `CUDA_OXIDE_TARGET` (set by `cargo oxide`'s `--arch=<sm_XX>`),
+//!   then the `CUDA_OXIDE_DEVICE_ARCH` hint (auto-detected GPU arch), then a
+//!   `sm_120` default.
 //!
 //! # Example
 //!
@@ -157,6 +158,57 @@ pub fn build_cubin_from_ll(ll_path: &Path, arch: &str) -> Result<PathBuf, LtoirE
         source,
     })?;
 
+    let ltoir = compile_nvvm_ir_to_ltoir(&ll_bytes, &ll_path.display().to_string(), arch)?;
+
+    std::fs::write(&ltoir_path, &ltoir).map_err(|source| LtoirError::Io {
+        path: ltoir_path.clone(),
+        source,
+    })?;
+
+    // ---- nvJitLink: LTOIR -> cubin --------------------------------------
+    let cubin = link_ltoir_to_cubin(&ltoir, &ltoir_path.display().to_string(), arch)?;
+
+    std::fs::write(&cubin_path, &cubin).map_err(|source| LtoirError::Io {
+        path: cubin_path.clone(),
+        source,
+    })?;
+
+    Ok(cubin_path)
+}
+
+/// Compile NVVM IR bytes to a loadable cubin image in memory.
+///
+/// This is the embedded-artifact counterpart of [`build_cubin_from_ll`]. It
+/// adds `libdevice.10.bc`, asks libNVVM for LTOIR, links that LTOIR with
+/// nvJitLink, and returns the final cubin bytes without creating sidecar files.
+pub fn build_cubin_from_nvvm_ir(
+    nvvm_ir: &[u8],
+    module_name: &str,
+    arch: &str,
+) -> Result<Vec<u8>, LtoirError> {
+    let ltoir = compile_nvvm_ir_to_ltoir(nvvm_ir, module_name, arch)?;
+    let ltoir_name = format!("{module_name}.ltoir");
+    link_ltoir_to_cubin(&ltoir, &ltoir_name, arch)
+}
+
+/// Link a single LTOIR payload to a loadable cubin image in memory.
+pub fn link_ltoir_to_cubin(
+    ltoir: &[u8],
+    module_name: &str,
+    arch: &str,
+) -> Result<Vec<u8>, LtoirError> {
+    let nvj = LibNvJitLink::load()?;
+    let arch_opt = format!("-arch={arch}");
+    let mut linker = Linker::new(&nvj, &[&arch_opt, "-lto"])?;
+    linker.add(InputType::Ltoir, ltoir, module_name)?;
+    Ok(linker.finish()?)
+}
+
+fn compile_nvvm_ir_to_ltoir(
+    nvvm_ir: &[u8],
+    module_name: &str,
+    arch: &str,
+) -> Result<Vec<u8>, LtoirError> {
     let libdevice_path = find_libdevice()?;
     let libdevice_bytes = std::fs::read(&libdevice_path).map_err(|source| LtoirError::Io {
         path: libdevice_path.clone(),
@@ -173,29 +225,10 @@ pub fn build_cubin_from_ll(ll_path: &Path, arch: &str) -> Result<PathBuf, LtoirE
     // does its own symbol resolution -- but this matches the pattern used
     // by NVCC and the device_ffi_test C tools.
     prog.add_module(&libdevice_bytes, "libdevice.10.bc")?;
-    prog.add_module(&ll_bytes, &ll_path.display().to_string())?;
+    prog.add_module(nvvm_ir, module_name)?;
 
     let arch_opt = format!("-arch={arch_compute}");
-    let ltoir = prog.compile(&[&arch_opt, "-gen-lto"])?;
-
-    std::fs::write(&ltoir_path, &ltoir).map_err(|source| LtoirError::Io {
-        path: ltoir_path.clone(),
-        source,
-    })?;
-
-    // ---- nvJitLink: LTOIR -> cubin --------------------------------------
-    let nvj = LibNvJitLink::load()?;
-    let arch_opt = format!("-arch={arch}");
-    let mut linker = Linker::new(&nvj, &[&arch_opt, "-lto"])?;
-    linker.add(InputType::Ltoir, &ltoir, &ltoir_path.display().to_string())?;
-    let cubin = linker.finish()?;
-
-    std::fs::write(&cubin_path, &cubin).map_err(|source| LtoirError::Io {
-        path: cubin_path.clone(),
-        source,
-    })?;
-
-    Ok(cubin_path)
+    Ok(prog.compile(&[&arch_opt, "-gen-lto"])?)
 }
 
 // ============================================================================
@@ -282,14 +315,19 @@ pub fn find_libdevice() -> Result<PathBuf, LtoirError> {
     })
 }
 
-/// Read the GPU arch (`sm_XX`) from `CUDA_OXIDE_TARGET`, defaulting to
-/// `sm_120` (consumer Blackwell, RTX 5090) when the env var is unset.
+/// Read the GPU arch (`sm_XX`) for the cubin build, defaulting to `sm_120`
+/// (consumer Blackwell, RTX 5090) when nothing else is set.
 ///
-/// `cargo oxide run --arch=<arch>` sets `CUDA_OXIDE_TARGET` for the spawned
-/// binary, so `cargo oxide run --arch=sm_90 my_kernel` causes this helper
-/// to return `"sm_90"`.
+/// Resolution order:
+/// - `CUDA_OXIDE_TARGET` -- an explicit pin. `cargo oxide run --arch=<arch>`
+///   sets it for the spawned binary, so `--arch=sm_90` yields `"sm_90"`.
+/// - `CUDA_OXIDE_DEVICE_ARCH` -- the auto-detected arch of the GPU in this
+///   machine, forwarded by `cargo oxide run` when no `--arch` was given.
+/// - `sm_120` fallback.
 pub fn target_arch() -> String {
-    std::env::var("CUDA_OXIDE_TARGET").unwrap_or_else(|_| "sm_120".to_string())
+    std::env::var("CUDA_OXIDE_TARGET")
+        .or_else(|_| std::env::var("CUDA_OXIDE_DEVICE_ARCH"))
+        .unwrap_or_else(|_| "sm_120".to_string())
 }
 
 /// Directory to search for kernel artifacts (`.cubin` / `.ptx` / `.ll`).

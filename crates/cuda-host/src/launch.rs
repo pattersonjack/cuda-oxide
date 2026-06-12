@@ -10,7 +10,10 @@
 //!
 //! - **Macro** (`cuda_launch!`): Captures kernel identifier → PTX name string,
 //!   marshals arguments into a `Vec<*mut c_void>`, and calls
-//!   `cuda_core::launch_kernel` directly.
+//!   `cuda_core::launch_kernel` directly. The macro is caller-unsafe: it
+//!   cannot check argument count or types against the kernel, so every use
+//!   must sit inside an `unsafe { }` block. Prefer `#[cuda_module]` for
+//!   kernels embedded in your own crate.
 //! - **Traits** (`CudaKernel`, `GenericCudaKernel`): Provide PTX entry-point
 //!   names for rust-analyzer and compile-time validation.
 
@@ -287,11 +290,22 @@ pub fn set_async_kernel_cluster_dim(
 
 #[doc(hidden)]
 #[cfg(feature = "async")]
+pub fn set_async_kernel_cooperative(
+    launch: &mut cuda_async::launch::AsyncKernelLaunch<'_>,
+    cooperative: bool,
+) {
+    launch.set_cooperative(cooperative);
+}
+
+#[doc(hidden)]
+#[cfg(feature = "async")]
 pub fn push_async_kernel_scalar<'a, T: KernelScalar + 'a>(
     launch: &mut cuda_async::launch::AsyncKernelLaunch<'a>,
     value: T,
 ) {
-    launch.push_scalar_arg(value);
+    if std::mem::size_of::<T>() != 0 {
+        launch.push_scalar_arg(value);
+    }
 }
 
 #[doc(hidden)]
@@ -325,10 +339,10 @@ pub fn load_cuda_module_from_async_context<F, R>(
     f: F,
 ) -> Result<R, cuda_async::error::DeviceError>
 where
-    F: FnOnce(&Arc<cuda_core::CudaContext>) -> Result<R, cuda_core::EmbeddedModuleError>,
+    F: FnOnce(&Arc<cuda_core::CudaContext>) -> Result<R, crate::EmbeddedModuleError>,
 {
     cuda_async::device_context::with_cuda_context(device_id, |ctx| f(ctx))?.map_err(|error| {
-        if let cuda_core::EmbeddedModuleError::Driver(error) = error {
+        if let crate::EmbeddedModuleError::Driver(error) = error {
             cuda_async::error::DeviceError::Driver(error)
         } else {
             cuda_async::error::DeviceError::KernelCache(error.to_string())
@@ -363,10 +377,13 @@ pub fn load_kernel_module_async(
 /// # Example
 ///
 /// ```ignore
-/// cuda_launch! {
-///     kernel: scale,
-///     // ...
-///     args: (Scalar(factor), &input_dev, &mut output_dev)
+/// // SAFETY: args match `scale`'s signature.
+/// unsafe {
+///     cuda_launch! {
+///         kernel: scale,
+///         // ...
+///         args: (Scalar(factor), &input_dev, &mut output_dev)
+///     }
 /// }
 /// ```
 pub struct Scalar<T>(pub T);
@@ -376,10 +393,13 @@ pub struct Scalar<T>(pub T);
 /// # Example
 ///
 /// ```ignore
-/// cuda_launch! {
-///     kernel: transform,
-///     // ...
-///     args: (ReadOnly(&input_dev), &mut output_dev)
+/// // SAFETY: args match `transform`'s signature.
+/// unsafe {
+///     cuda_launch! {
+///         kernel: transform,
+///         // ...
+///         args: (ReadOnly(&input_dev), &mut output_dev)
+///     }
 /// }
 /// ```
 pub struct ReadOnly<'a, T>(pub &'a T);
@@ -391,10 +411,13 @@ pub struct ReadOnly<'a, T>(pub &'a T);
 /// # Example
 ///
 /// ```ignore
-/// cuda_launch! {
-///     kernel: generate,
-///     // ...
-///     args: (WriteOnly(&mut output_dev),)
+/// // SAFETY: args match `generate`'s signature.
+/// unsafe {
+///     cuda_launch! {
+///         kernel: generate,
+///         // ...
+///         args: (WriteOnly(&mut output_dev),)
+///     }
 /// }
 /// ```
 pub struct WriteOnly<'a, T>(pub &'a mut T);

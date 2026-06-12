@@ -129,22 +129,25 @@ pub fn debug_kernel(data: &[f32]) {
 }
 ```
 
-`gpu_printf!` compiles to device-side `vprintf` with C vararg promotion. `gpu_assert!` traps on failure.
+`gpu_printf!` compiles to device-side `vprintf` with C vararg promotion.
+`gpu_assert!` traps on failure. The `debug` module also exposes GPU timing
+register reads such as `clock64()` and `globaltimer()`.
 
 ## Proc-Macro Re-exports
 
 These are defined in `cuda-macros` and re-exported from `cuda-device` for convenience:
 
-| Attribute           | Purpose                                       |
-|---------------------|-----------------------------------------------|
-| `#[kernel]`         | Mark a function as a GPU kernel entry point   |
-| `#[device]`         | Mark a helper function or extern block        |
-| `#[launch_bounds]`  | Set max threads / min blocks per SM           |
-| `#[cluster_launch]` | Set compile-time cluster dimensions           |
-| `#[convergent]`     | Mark as convergent (barrier semantics)        |
-| `#[pure]`           | Mark as pure (no side effects)                |
-| `#[readonly]`       | Mark as read-only                             |
-| `gpu_printf!`       | Device-side printf                            |
+| Attribute                | Purpose                                       |
+|--------------------------|-----------------------------------------------|
+| `#[kernel]`              | Mark a function as a GPU kernel entry point   |
+| `#[device]`              | Mark a helper function or extern block        |
+| `#[launch_bounds]`       | Set max threads / min blocks per SM           |
+| `#[cluster_launch]`      | Set compile-time cluster dimensions           |
+| `#[cooperative_launch]`  | Launch as cooperative (for `grid::sync()`)    |
+| `#[convergent]`          | Mark as convergent (barrier semantics)        |
+| `#[pure]`                | Mark as pure (no side effects)                |
+| `#[readonly]`            | Mark as read-only                             |
+| `gpu_printf!`            | Device-side printf                            |
 
 ## Safety Model
 

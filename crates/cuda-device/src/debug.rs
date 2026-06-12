@@ -11,13 +11,14 @@
 //! |--------------------|-------------------------------|---------------------|
 //! | [`clock()`]        | Read 32-bit GPU clock counter | `clock()`           |
 //! | [`clock64()`]      | Read 64-bit GPU clock counter | `clock64()`         |
+//! | [`globaltimer()`]  | Read GPU global timer         | `%globaltimer`      |
 //! | [`trap()`]         | Abort kernel execution        | `__trap()`          |
 //! | [`breakpoint()`]   | Insert cuda-gdb breakpoint    | `__brkpt()`         |
 //! | [`prof_trigger()`] | Signal NVIDIA profiler        | `__prof_trigger(N)` |
 //!
 //! # Example: Micro-benchmarking
 //!
-//! ```rust
+//! ```rust,ignore
 //! use cuda_device::debug;
 //!
 //! let start = debug::clock64();
@@ -28,7 +29,7 @@
 //!
 //! # Example: Runtime Assertion
 //!
-//! ```rust
+//! ```rust,ignore
 //! use cuda_device::debug;
 //!
 //! if value < 0 {
@@ -52,7 +53,7 @@
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use cuda_device::debug;
 ///
 /// let start = debug::clock();
@@ -83,7 +84,7 @@ pub fn clock() -> u32 {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use cuda_device::debug;
 ///
 /// let start = debug::clock64();
@@ -103,6 +104,28 @@ pub fn clock64() -> u64 {
     unreachable!("clock64 called outside CUDA kernel context")
 }
 
+/// Read the GPU global timer.
+///
+/// Returns a 64-bit timer value from PTX `%globaltimer`. Unlike [`clock64()`],
+/// this is a global timer source, so it is preferable when measuring interactions
+/// that may span multiple SMs.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use cuda_device::debug;
+///
+/// let start = debug::globaltimer();
+/// // ... operation to measure ...
+/// let end = debug::globaltimer();
+/// let ticks = end.wrapping_sub(start);
+/// ```
+#[inline(never)]
+pub fn globaltimer() -> u64 {
+    // Lowered to: call i64 @llvm.nvvm.read.ptx.sreg.globaltimer()
+    unreachable!("globaltimer called outside CUDA kernel context")
+}
+
 // =============================================================================
 // Trap/Abort Intrinsics
 // =============================================================================
@@ -120,7 +143,7 @@ pub fn clock64() -> u64 {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use cuda_device::debug;
 ///
 /// if invalid_condition {
@@ -150,7 +173,7 @@ pub fn trap() -> ! {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use cuda_device::debug;
 ///
 /// // Only break on thread 0 to avoid overwhelming the debugger
@@ -183,7 +206,7 @@ pub fn breakpoint() {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use cuda_device::debug;
 ///
 /// debug::prof_trigger::<0>();  // Mark start of region
@@ -213,7 +236,7 @@ pub fn prof_trigger<const N: u32>() {
 ///
 /// # Usage
 ///
-/// ```rust
+/// ```rust,ignore
 /// use cuda_device::gpu_assert;
 ///
 /// // Simple assertion

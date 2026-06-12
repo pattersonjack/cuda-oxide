@@ -73,7 +73,7 @@
 //! │   │   │                 │           │                         │           │     │
 //! │   │   │ dialect-mir     │           │  Standard x86_64 code   │           │     │
 //! │   │   │     ▼ (mem2reg) │           │                         │           │     │
-//! │   │   │ dialect-llvm    │           │                         │           │     │
+//! │   │   │ LLVM dialect    │           │                         │           │     │
 //! │   │   │     ▼           │           │                         │           │     │
 //! │   │   │ LLVM IR (.ll)   │           │                         │           │     │
 //! │   │   │     ▼ (llc)     │           │                         │           │     │
@@ -280,7 +280,7 @@
 //! |------------------------|--------------------------------------|
 //! | `CUDA_OXIDE_VERBOSE`   | Print detailed compilation progress  |
 //! | `CUDA_OXIDE_DUMP_MIR`  | Dump the `dialect-mir` module        |
-//! | `CUDA_OXIDE_DUMP_LLVM` | Dump the `dialect-llvm` module       |
+//! | `CUDA_OXIDE_DUMP_LLVM` | Dump the LLVM dialect module         |
 //! | `CUDA_OXIDE_PTX_DIR`   | Override PTX output directory        |
 //! | `CUDA_OXIDE_TARGET`    | Override GPU target (e.g., `sm_90a`) |
 //!
@@ -372,7 +372,7 @@ pub struct CudaCodegenConfig {
     pub dump_rustc_mir: bool,
     /// Dump the `dialect-mir` module during device compilation.
     pub dump_mir_dialect: bool,
-    /// Dump the `dialect-llvm` module during device compilation.
+    /// Dump the LLVM dialect module during device compilation.
     pub dump_llvm_dialect: bool,
     /// Override PTX output directory (defaults to current directory).
     pub ptx_output_dir: Option<std::path::PathBuf>,
@@ -527,28 +527,89 @@ impl CodegenBackend for CudaCodegenBackend {
                         dump_llvm_dialect: self.config.dump_llvm_dialect,
                     };
 
-                // Run the cuda-oxide pipeline!
-                match device_codegen::generate_device_code(
-                    tcx,
-                    device_functions,
-                    &collection_result.device_externs,
-                    &device_config,
-                ) {
-                    Ok(result) => {
-                        if self.config.verbose {
+                // Run the cuda-oxide pipeline, catching backend panics and
+                // re-emitting them as a cuda-oxide diagnostic. A panic
+                // inside the pipeline (typically pliron's IR invariant
+                // checks) would otherwise escape to rustc's panic hook and
+                // get dressed up as "the compiler unexpectedly panicked,
+                // please file a rustc bug". The bug is in cuda-oxide, so
+                // we want users pointed at our tracker, not rustc's.
+                //
+                // We also briefly swap rustc's ICE hook for our own, because
+                // panic hooks fire *before* catch_unwind catches the unwind.
+                // Without the swap, the rustc-flavoured banner would still
+                // print to stderr ahead of our diagnostic. The replacement
+                // hook also captures a backtrace, since by the time we
+                // catch the unwind the stack we want is gone. Capture
+                // honours `RUST_BACKTRACE` so an unset env var still costs
+                // nothing. Hooks are global; rustc's codegen at this entry
+                // point is effectively single-threaded, so the brief
+                // window where the hook is swapped is safe.
+                let (panic_outcome, panic_backtrace) = {
+                    use std::backtrace::Backtrace;
+                    use std::panic::{AssertUnwindSafe, catch_unwind};
+                    use std::sync::{Arc, Mutex};
+                    let bt_slot: Arc<Mutex<Option<Backtrace>>> = Arc::new(Mutex::new(None));
+                    let bt_setter = Arc::clone(&bt_slot);
+                    let prev_hook = std::panic::take_hook();
+                    std::panic::set_hook(Box::new(move |_info| {
+                        if let Ok(mut g) = bt_setter.lock() {
+                            *g = Some(Backtrace::capture());
+                        }
+                    }));
+                    let r = catch_unwind(AssertUnwindSafe(|| {
+                        device_codegen::generate_device_code(
+                            tcx,
+                            device_functions,
+                            &collection_result.device_externs,
+                            &device_config,
+                        )
+                    }));
+                    std::panic::set_hook(prev_hook);
+                    (r, bt_slot)
+                };
+
+                match panic_outcome {
+                    Err(payload) => {
+                        let msg = payload
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "<opaque panic payload>".into());
+                        match panic_backtrace.lock().ok().and_then(|mut g| g.take()) {
+                            Some(bt)
+                                if bt.status() == std::backtrace::BacktraceStatus::Captured =>
+                            {
+                                eprintln!("[rustc_codegen_cuda] backtrace:\n{bt}");
+                            }
+                            _ => {
+                                eprintln!(
+                                    "[rustc_codegen_cuda] note: run with `RUST_BACKTRACE=1` to display a backtrace"
+                                );
+                            }
+                        }
+                        tcx.dcx().fatal(format!(
+                            "[rustc_codegen_cuda] Internal compiler error in \
+                             device codegen: {msg}. This is a bug in cuda-oxide. \
+                             Please file at https://github.com/NVlabs/cuda-oxide/issues"
+                        ));
+                    }
+                    Ok(Ok(result)) => {
+                        if self.config.verbose
+                            && let Some(artifact) = result.artifact.as_ref()
+                        {
                             eprintln!(
-                                "[rustc_codegen_cuda] Device codegen complete: {} (target: {})",
-                                result.ptx_path.display(),
-                                result.target
+                                "[rustc_codegen_cuda] Device codegen complete: {} ({:?}, target: {})",
+                                artifact.name, artifact.kind, result.target
                             );
                         }
-                        if let Some(ptx_content) = result.ptx_content.as_deref() {
-                            match write_ptx_artifact_object(
+                        if let Some(artifact) = result.artifact.as_ref() {
+                            match write_device_artifact_object(
                                 &device_config.output_dir,
                                 &device_config.output_name,
                                 tcx.sess.target.llvm_target.as_ref(),
                                 &result,
-                                ptx_content,
+                                artifact,
                                 device_functions,
                             ) {
                                 Ok(path) => {
@@ -562,18 +623,18 @@ impl CodegenBackend for CudaCodegenBackend {
                                 }
                                 Err(e) => {
                                     tcx.dcx().fatal(format!(
-                                        "[rustc_codegen_cuda] Failed to embed PTX artifact: {e}"
+                                        "[rustc_codegen_cuda] Failed to embed device artifact: {e}"
                                     ));
                                 }
                             }
-                        } else if self.config.verbose {
-                            eprintln!(
-                                "[rustc_codegen_cuda] Skipping embedded PTX artifact: no PTX output"
+                        } else {
+                            tcx.dcx().fatal(
+                                "[rustc_codegen_cuda] Device codegen did not produce an embeddable artifact",
                             );
                         }
                         Some(result)
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         // Hard-fail: a swallowed device codegen error produces
                         // a host binary with stale or missing PTX, which then
                         // silently mis-runs on the GPU. The wrapper script
@@ -641,21 +702,32 @@ impl CodegenBackend for CudaCodegenBackend {
     }
 }
 
-fn write_ptx_artifact_object(
+fn write_device_artifact_object(
     output_dir: &Path,
     output_name: &str,
     host_target: &str,
     result: &device_codegen::DeviceCodegenResult,
-    ptx_content: &str,
+    artifact: &device_codegen::DeviceCodegenArtifact,
     functions: &[collector::CollectedFunction<'_>],
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let ptx_name = format!("{output_name}.ptx");
     let bundle_name = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| output_name.to_string());
+    let payload_kind = match artifact.kind {
+        device_codegen::DeviceCodegenArtifactKind::Ptx => oxide_artifacts::ArtifactPayloadKind::Ptx,
+        device_codegen::DeviceCodegenArtifactKind::NvvmIr => {
+            oxide_artifacts::ArtifactPayloadKind::NvvmIr
+        }
+        device_codegen::DeviceCodegenArtifactKind::Ltoir => {
+            oxide_artifacts::ArtifactPayloadKind::Ltoir
+        }
+        device_codegen::DeviceCodegenArtifactKind::Cubin => {
+            oxide_artifacts::ArtifactPayloadKind::Cubin
+        }
+    };
     let mut spec = oxide_artifacts::ArtifactBundleSpec::new(&bundle_name, &result.target)
         .with_payload(oxide_artifacts::ArtifactPayloadSpec::new(
-            oxide_artifacts::ArtifactPayloadKind::Ptx,
-            &ptx_name,
-            ptx_content.as_bytes(),
+            payload_kind,
+            &artifact.name,
+            &artifact.bytes,
         ));
     for function in functions {
         let kind = if function.is_kernel {
@@ -670,7 +742,20 @@ fn write_ptx_artifact_object(
     }
 
     let blob = oxide_artifacts::build_artifact_blob(&spec)?;
-    let object = oxide_artifacts::build_host_object_for_target(&blob, host_target)?;
+    // Define a link-anchor symbol at the start of the `.oxart` data. When
+    // this crate is a library, the artifact object becomes an rlib archive
+    // member, and the linker only extracts it if some other object holds an
+    // undefined reference to a symbol defined here. The `#[cuda_module]`
+    // macro emits that reference from the generated `load_named()`, derived
+    // from the same CARGO_PKG_NAME / CARGO_PKG_VERSION environment that this
+    // rustc invocation sees, so the two names always match. Without the
+    // anchor, library-crate bundles were dead-stripped and `load()` failed
+    // at runtime with ModuleNotFound (issue #72).
+    let package_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let anchor_symbol =
+        reserved_oxide_symbols::artifact_anchor_symbol(&bundle_name, &package_version);
+    let object =
+        oxide_artifacts::build_host_object_for_target(&blob, host_target, Some(&anchor_symbol))?;
     let safe_output_name = sanitize_path_component(output_name);
     let artifact_id = ARTIFACT_OBJECT_COUNTER.fetch_add(1, Ordering::Relaxed);
     let object_dir = output_dir

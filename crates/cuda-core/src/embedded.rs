@@ -98,7 +98,9 @@ pub fn load_first_embedded_module(
 }
 
 fn loadable_payload(bundle: &OwnedArtifactBundle) -> Option<&[u8]> {
-    bundle.payload(ArtifactPayloadKind::Ptx)
+    bundle
+        .payload(ArtifactPayloadKind::Cubin)
+        .or_else(|| bundle.payload(ArtifactPayloadKind::Ptx))
 }
 
 #[derive(Debug)]
@@ -184,6 +186,27 @@ mod tests {
         assert_eq!(module.payload(ArtifactPayloadKind::Ptx), Some(&b"ptx"[..]));
     }
 
+    #[test]
+    fn embedded_module_accepts_cubin_payload() {
+        let bundle = OwnedArtifactBundle {
+            name: "demo".to_string(),
+            target: "sm_90".to_string(),
+            payloads: vec![OwnedArtifactPayload {
+                kind: ArtifactPayloadKind::Cubin,
+                name: "demo.cubin".to_string(),
+                bytes: b"cubin".to_vec(),
+            }],
+            entries: Vec::new(),
+        };
+
+        let module = EmbeddedModule::new(bundle).unwrap();
+        assert_eq!(module.name(), "demo");
+        assert_eq!(
+            module.payload(ArtifactPayloadKind::Cubin),
+            Some(&b"cubin"[..])
+        );
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn artifact_bundles_from_binary_path_reads_linked_executable() {
@@ -198,7 +221,15 @@ mod tests {
             ArtifactPayloadSpec::new(ArtifactPayloadKind::Ptx, "linked.ptx", b"ptx"),
         ))
         .unwrap();
-        let object = build_host_object_for_target(&blob, "x86_64-unknown-linux-gnu").unwrap();
+        // Mirror production: the backend always defines a link-anchor
+        // symbol in the artifact object. The linked-executable round trip
+        // must keep working with that symbol present.
+        let object = build_host_object_for_target(
+            &blob,
+            "x86_64-unknown-linux-gnu",
+            Some("cuda_oxide_artifact_anchor_246e25db_linked_0_0_0"),
+        )
+        .unwrap();
         std::fs::write(&source_path, "fn main() {}\n").unwrap();
         std::fs::write(&object_path, object).unwrap();
 

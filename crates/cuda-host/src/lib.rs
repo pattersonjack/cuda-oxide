@@ -25,16 +25,23 @@
 //!
 //! ## Modules
 //!
-//! - [`tiling`]: Layout transformations for tensor core operations (tcgen05)
+//! - [`embedded`]: Load `#[cuda_module]` artifact bundles embedded in the host
+//!   binary (PTX, cubin, NVVM IR, LTOIR)
 //! - [`launch`]: Kernel launch traits (`CudaKernel`, `GenericCudaKernel`)
+//! - [`ltoir`]: libNVVM + nvJitLink wrappers (`load_kernel_module`, in-memory
+//!   `build_cubin_from_nvvm_ir`, `link_ltoir_to_cubin`)
+//! - [`tiling`]: Layout transformations for tensor core operations (tcgen05)
 //!
 //! ## Macros
 //!
 //! - [`cuda_module`]: Generate a typed embedded-module loader and per-kernel
 //!   sync launch methods from an inline kernel module. Enable the `async`
 //!   feature for borrowed and owned async launch methods.
-//! - [`cuda_launch!`]: Low-level launch macro retained for migration.
-//! - [`cuda_launch_async!`]: Low-level async launch macro retained for
+//! - [`cuda_launch!`]: Unsafe low-level launch macro. It cannot check
+//!   argument count or types, so callers must wrap it in `unsafe { }`. Its
+//!   niche is modules loaded at runtime by name; for embedded kernels use
+//!   `#[cuda_module]`.
+//! - `cuda_launch_async!`: Low-level async launch macro retained for
 //!   migration when the `async` feature is enabled.
 //!
 //! ## Usage
@@ -71,6 +78,7 @@
 //! let c_host = c_dev.to_host_vec(&stream)?;
 //! ```
 
+pub mod embedded;
 pub mod launch;
 pub mod ltoir;
 pub mod tiling;
@@ -88,7 +96,7 @@ pub use launch::{
     KernelSliceArg, KernelSliceArgMut, load_cuda_module_from_async_context,
     load_kernel_module_async, new_async_kernel_launch, new_owned_async_kernel_launch,
     push_async_kernel_scalar, push_async_read_only_device_slice, push_async_writable_device_slice,
-    set_async_kernel_cluster_dim,
+    set_async_kernel_cluster_dim, set_async_kernel_cooperative,
 };
 
 #[cfg(feature = "async")]
@@ -96,6 +104,7 @@ pub use cuda_async;
 #[cfg(feature = "async")]
 pub use cuda_async::launch::{AsyncKernelLaunch, OwnedAsyncKernelLaunch};
 
+pub use embedded::{EmbeddedModuleError, load_embedded_module, load_first_embedded_module};
 /// Loads a compiled kernel module by name. Tries `<name>.cubin`, then
 /// `<name>.ptx`, and finally falls through to the LTOIR build path
 /// (`<name>.ll` plus libdevice → cubin) when cuda-oxide auto-detected
@@ -107,7 +116,6 @@ pub use ltoir::{LtoirError, load_kernel_module};
 // Re-export launch macros from cuda-macros for convenience.
 pub use cuda_macros::{cuda_launch, cuda_module};
 
-pub use cuda_core::embedded;
 /// Re-export of [`cuda_macros::cuda_launch_async`].
 ///
 /// Returns a lazy `cuda_async::launch::AsyncKernelLaunch`. Stream assignment is
