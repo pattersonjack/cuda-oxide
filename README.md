@@ -303,7 +303,7 @@ cargo oxide run gemm_sol
 - MathDx integration: cuFFTDx thread-level FFT, cuBLASDx block-level GEMM
 - Tile interop (experimental): [`cutile_inter_kernel`](crates/rustc-codegen-cuda/examples/cutile_inter_kernel/README.md) chains a cutile-rs Tile kernel and a cuda-oxide SIMT PTX kernel on the same CUDA stream over shared device tensors. Intra-kernel Tile interop is work in progress and tracked in [#96](https://github.com/NVlabs/cuda-oxide/issues/96).
 - Host runtime: `cuda-core` (explicit control, pinned host transfers) and `cuda-async` (composable async operations)
-- GEMM SoL: 868 TFLOPS (58% of cublasLt FP16 SoL) on B200 (148 SMs) with cta_group::2 + CLC + 4-stage pipeline (`gemm_sol` example measures the cublasLt baseline live via `bench/cublaslt_bench` — absolute TFLOPS scale with SM count on smaller Blackwell DC SKUs; per-phase tables for both 148-SM and 80-SM variants are in `crates/rustc-codegen-cuda/examples/gemm_sol/README.md`)
+- GEMM SoL: 868 TFLOPS (58% of cublasLt FP16 SoL) on B200 (148 SMs) with cta_group::2 + CLC + 4-stage pipeline (see `gemm_sol` example)
 
 ## Documentation
 
