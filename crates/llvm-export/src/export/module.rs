@@ -37,7 +37,12 @@ pub(super) fn export_module_with_externs_impl(
     let mut output = String::new();
     let emit_all_annotations = config.emit_all_kernel_annotations();
     let emit_ptx_kernel_keyword = config.emit_ptx_kernel_keyword();
-    let mut state = ModuleExportState::new(ctx, emit_all_annotations, emit_ptx_kernel_keyword);
+    let mut state = ModuleExportState::new(
+        ctx,
+        emit_all_annotations,
+        emit_ptx_kernel_keyword,
+        config.pointer_mode(),
+    );
 
     // 1. Header
     writeln!(
@@ -138,13 +143,13 @@ pub(super) fn export_module_with_externs_impl(
 
         // Include all kernels
         for k in &state.all_kernels {
-            used_refs.push(format!("ptr @{}", k.name));
+            used_refs.push(state.llvm_used_entry(&k.name));
         }
 
         // Include standalone device functions (when no kernels present)
         if state.all_kernels.is_empty() {
             for name in &state.device_functions {
-                used_refs.push(format!("ptr @{}", name));
+                used_refs.push(state.llvm_used_entry(name));
             }
         }
 
@@ -152,8 +157,9 @@ pub(super) fn export_module_with_externs_impl(
             writeln!(&mut output).unwrap();
             writeln!(
                 &mut output,
-                "@llvm.used = appending global [{} x ptr] [{}], section \"llvm.metadata\"",
+                "@llvm.used = appending global [{} x {}] [{}], section \"llvm.metadata\"",
                 used_refs.len(),
+                state.llvm_used_entry_type(),
                 used_refs.join(", ")
             )
             .unwrap();
@@ -207,7 +213,12 @@ pub(super) fn export_module_to_string_with_config(
     let mut output = String::new();
     let emit_all_annotations = config.emit_all_kernel_annotations();
     let emit_ptx_kernel_keyword = config.emit_ptx_kernel_keyword();
-    let mut state = ModuleExportState::new(ctx, emit_all_annotations, emit_ptx_kernel_keyword);
+    let mut state = ModuleExportState::new(
+        ctx,
+        emit_all_annotations,
+        emit_ptx_kernel_keyword,
+        config.pointer_mode(),
+    );
 
     // 1. Header
     writeln!(
@@ -277,13 +288,13 @@ pub(super) fn export_module_to_string_with_config(
         let mut used_refs: Vec<String> = Vec::new();
 
         for k in &state.all_kernels {
-            used_refs.push(format!("ptr @{}", k.name));
+            used_refs.push(state.llvm_used_entry(&k.name));
         }
 
         // Include standalone device functions when no kernels are present
         if state.all_kernels.is_empty() {
             for name in &state.device_functions {
-                used_refs.push(format!("ptr @{}", name));
+                used_refs.push(state.llvm_used_entry(name));
             }
         }
 
@@ -291,8 +302,9 @@ pub(super) fn export_module_to_string_with_config(
             writeln!(&mut output).unwrap();
             writeln!(
                 &mut output,
-                "@llvm.used = appending global [{} x ptr] [{}], section \"llvm.metadata\"",
+                "@llvm.used = appending global [{} x {}] [{}], section \"llvm.metadata\"",
                 used_refs.len(),
+                state.llvm_used_entry_type(),
                 used_refs.join(", ")
             )
             .unwrap();
@@ -334,10 +346,11 @@ pub(super) fn export_module_to_string_with_config(
             for kernel in state.all_kernels.iter() {
                 if !special_kernel_names.contains(kernel.name.as_str()) {
                     // Basic kernel annotation: !{ptr @kernel_name, !"kernel", i32 1}
+                    let kernel_ref = state.metadata_function_ref(&kernel.name);
                     writeln!(
                         &mut output,
-                        "!{} = !{{ptr @{}, !\"kernel\", i32 1}}",
-                        md_id, kernel.name
+                        "!{} = !{{{}, !\"kernel\", i32 1}}",
+                        md_id, kernel_ref
                     )
                     .unwrap();
                     metadata_refs.push(format!("!{}", md_id));
@@ -349,10 +362,11 @@ pub(super) fn export_module_to_string_with_config(
         // Each kernel with cluster config gets its own metadata node
         // Format: !{ptr @kernel_name, !"kernel", i32 1, !"cluster_dim_x", i32 X, ...}
         for cfg in state.cluster_kernels.iter() {
+            let kernel_ref = state.metadata_function_ref(&cfg.name);
             writeln!(
                 &mut output,
-                "!{} = !{{ptr @{}, !\"kernel\", i32 1, !\"cluster_dim_x\", i32 {}, !\"cluster_dim_y\", i32 {}, !\"cluster_dim_z\", i32 {}}}",
-                md_id, cfg.name, cfg.dim_x, cfg.dim_y, cfg.dim_z
+                "!{} = !{{{}, !\"kernel\", i32 1, !\"cluster_dim_x\", i32 {}, !\"cluster_dim_y\", i32 {}, !\"cluster_dim_z\", i32 {}}}",
+                md_id, kernel_ref, cfg.dim_x, cfg.dim_y, cfg.dim_z
             )
             .unwrap();
             metadata_refs.push(format!("!{}", md_id));
@@ -364,30 +378,33 @@ pub(super) fn export_module_to_string_with_config(
         // See: https://llvm.org/docs/NVPTXUsage.html
         for cfg in state.launch_bounds_kernels.iter() {
             // Emit maxntidx (we use the single max_threads value for 1D block size)
+            let kernel_ref = state.metadata_function_ref(&cfg.name);
             writeln!(
                 &mut output,
-                "!{} = !{{ptr @{}, !\"maxntidx\", i32 {}}}",
-                md_id, cfg.name, cfg.max_threads
+                "!{} = !{{{}, !\"maxntidx\", i32 {}}}",
+                md_id, kernel_ref, cfg.max_threads
             )
             .unwrap();
             metadata_refs.push(format!("!{}", md_id));
             md_id += 1;
 
             // Emit maxntidy = 1 (for complete 3D specification)
+            let kernel_ref = state.metadata_function_ref(&cfg.name);
             writeln!(
                 &mut output,
-                "!{} = !{{ptr @{}, !\"maxntidy\", i32 1}}",
-                md_id, cfg.name
+                "!{} = !{{{}, !\"maxntidy\", i32 1}}",
+                md_id, kernel_ref
             )
             .unwrap();
             metadata_refs.push(format!("!{}", md_id));
             md_id += 1;
 
             // Emit maxntidz = 1 (for complete 3D specification)
+            let kernel_ref = state.metadata_function_ref(&cfg.name);
             writeln!(
                 &mut output,
-                "!{} = !{{ptr @{}, !\"maxntidz\", i32 1}}",
-                md_id, cfg.name
+                "!{} = !{{{}, !\"maxntidz\", i32 1}}",
+                md_id, kernel_ref
             )
             .unwrap();
             metadata_refs.push(format!("!{}", md_id));
@@ -395,10 +412,11 @@ pub(super) fn export_module_to_string_with_config(
 
             // Emit minctasm as separate metadata node if specified (generates .minnctapersm in PTX)
             if let Some(min_blocks) = cfg.min_blocks {
+                let kernel_ref = state.metadata_function_ref(&cfg.name);
                 writeln!(
                     &mut output,
-                    "!{} = !{{ptr @{}, !\"minctasm\", i32 {}}}",
-                    md_id, cfg.name, min_blocks
+                    "!{} = !{{{}, !\"minctasm\", i32 {}}}",
+                    md_id, kernel_ref, min_blocks
                 )
                 .unwrap();
                 metadata_refs.push(format!("!{}", md_id));

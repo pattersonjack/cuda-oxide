@@ -3462,6 +3462,7 @@ fn translate_place_addr_from_slot(
 
     let mut current = slot;
     let mut current_prev_op = prev_op;
+    let mut current_is_slice_data_ptr = false;
 
     for (proj_idx, elem) in projection.iter().enumerate() {
         match elem {
@@ -3670,6 +3671,7 @@ fn translate_place_addr_from_slot(
                                 from_end: false, ..
                             } => {
                                 current = data_ptr;
+                                current_is_slice_data_ptr = true;
                                 continue;
                             }
                             // Unknown continuation: keep the conservative
@@ -3711,9 +3713,11 @@ fn translate_place_addr_from_slot(
                 }
                 current = load_op.deref(ctx).get_result(0);
                 current_prev_op = Some(load_op);
+                current_is_slice_data_ptr = false;
             }
 
             mir::ProjectionElem::Field(field_idx, field_ty) => {
+                current_is_slice_data_ptr = false;
                 let field_type = types::translate_type(ctx, field_ty)?;
                 let result_ptr_ty =
                     dialect_mir::types::MirPtrType::get_generic(ctx, field_type, is_mutable);
@@ -3746,10 +3750,11 @@ fn translate_place_addr_from_slot(
                 if *from_end {
                     return Ok(None);
                 }
-                let (pointee_kind, addr_space) = match pointer_pointee_kind(ctx, current) {
-                    Some(kind) => kind,
-                    None => return Ok(None),
-                };
+                let (pointee_kind, addr_space) =
+                    match pointer_pointee_kind(ctx, current, current_is_slice_data_ptr) {
+                        Some(kind) => kind,
+                        None => return Ok(None),
+                    };
 
                 let i64_ty = IntegerType::get(ctx, 64, Signedness::Signed);
                 let index_apint = APInt::from_i64(*offset as i64, NonZeroUsize::new(64).unwrap());
@@ -3784,6 +3789,7 @@ fn translate_place_addr_from_slot(
                 );
                 current = next_current;
                 current_prev_op = Some(addr_op);
+                current_is_slice_data_ptr = false;
             }
 
             // Runtime `arr[i]` indexing. Without this arm, a place like
@@ -3791,10 +3797,11 @@ fn translate_place_addr_from_slot(
             // and return a pointer to the array's first slot, miscompiling
             // every load through the reference into a load of element 0.
             mir::ProjectionElem::Index(index_local) => {
-                let (pointee_kind, addr_space) = match pointer_pointee_kind(ctx, current) {
-                    Some(kind) => kind,
-                    None => return Ok(None),
-                };
+                let (pointee_kind, addr_space) =
+                    match pointer_pointee_kind(ctx, current, current_is_slice_data_ptr) {
+                        Some(kind) => kind,
+                        None => return Ok(None),
+                    };
 
                 let index_place = mir::Place {
                     local: *index_local,
@@ -3824,6 +3831,7 @@ fn translate_place_addr_from_slot(
                 );
                 current = next_current;
                 current_prev_op = Some(addr_op);
+                current_is_slice_data_ptr = false;
             }
 
             // Enum-variant downcast (`(x as Variant).field`). Addressing an
@@ -3920,15 +3928,20 @@ fn emit_indexed_element_addr(
 
 /// Inspect a pointer value and return its pointee kind + address space, or
 /// `None` if the value's type isn't a `MirPtrType`.
-fn pointer_pointee_kind(ctx: &Context, ptr_value: Value) -> Option<(PointeeKind, u32)> {
+fn pointer_pointee_kind(
+    ctx: &Context,
+    ptr_value: Value,
+    force_direct: bool,
+) -> Option<(PointeeKind, u32)> {
     let ty = ptr_value.get_type(ctx);
     let ty_ref = ty.deref(ctx);
     let mir_ptr_ty = ty_ref.downcast_ref::<dialect_mir::types::MirPtrType>()?;
     let pointee = mir_ptr_ty.pointee;
     let addr_space = mir_ptr_ty.address_space;
     let pointee_ref = pointee.deref(ctx);
-    let kind = if let Some(arr_ty) = pointee_ref.downcast_ref::<dialect_mir::types::MirArrayType>()
-    {
+    let kind = if force_direct {
+        PointeeKind::Direct
+    } else if let Some(arr_ty) = pointee_ref.downcast_ref::<dialect_mir::types::MirArrayType>() {
         PointeeKind::Array(arr_ty.element_type())
     } else {
         PointeeKind::Direct

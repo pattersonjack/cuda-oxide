@@ -53,6 +53,7 @@ use crate::helpers;
 use dialect_mir::types::MirPtrType;
 use llvm_export::ops as llvm;
 use llvm_export::ops::GlobalOpExt;
+use llvm_export::pointer_facts::{LegacyType, set_value_type_fact};
 use llvm_export::types::ArrayType;
 use pliron::builtin::op_interfaces::SymbolOpInterface;
 use pliron::builtin::types::{IntegerType, Signedness};
@@ -94,6 +95,14 @@ pub(crate) fn convert_store(
     };
 
     let llvm_store = llvm::StoreOp::new(ctx, val, ptr);
+    let addrspace = ptr
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<llvm_export::types::PointerType>()
+        .map_or(0, llvm_export::types::PointerType::address_space);
+    let val_fact = LegacyType::from_llvm_type(ctx, val.get_type(ctx));
+    let ptr_fact = LegacyType::pointer_to(val_fact, addrspace);
+    set_value_type_fact(ctx, ptr, ptr_fact);
     copy_alignment(ctx, op, llvm_store.get_operation());
     rewriter.insert_operation(ctx, llvm_store.get_operation());
     rewriter.erase_operation(ctx, op);
@@ -126,6 +135,13 @@ pub(crate) fn convert_load(
     let llvm_ty = convert_type(ctx, result_ty).map_err(anyhow_to_pliron)?;
 
     let llvm_load = llvm::LoadOp::new(ctx, ptr, llvm_ty);
+    let addrspace = ptr
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<llvm_export::types::PointerType>()
+        .map_or(0, llvm_export::types::PointerType::address_space);
+    let ptr_fact = LegacyType::pointer_to_llvm(ctx, llvm_ty, addrspace);
+    set_value_type_fact(ctx, ptr, ptr_fact);
     copy_alignment(ctx, op, llvm_load.get_operation());
     rewriter.insert_operation(ctx, llvm_load.get_operation());
     rewriter.replace_operation(ctx, op, llvm_load.get_operation());
@@ -170,6 +186,9 @@ pub(crate) fn convert_alloca(
     let one_val = one_const.get_operation().deref(ctx).get_result(0);
 
     let alloca = llvm::AllocaOp::new(ctx, llvm_pointee, one_val);
+    let alloca_res = alloca.get_operation().deref(ctx).get_result(0);
+    let alloca_fact = LegacyType::pointer_to_llvm(ctx, llvm_pointee, 0);
+    set_value_type_fact(ctx, alloca_res, alloca_fact);
     copy_alignment(ctx, op, alloca.get_operation());
     rewriter.insert_operation(ctx, alloca.get_operation());
     rewriter.replace_operation(ctx, op, alloca.get_operation());
@@ -207,6 +226,8 @@ pub(crate) fn convert_ref(
     copy_alignment(ctx, op, alloca.get_operation());
     rewriter.insert_operation(ctx, alloca.get_operation());
     let alloca_ptr = alloca.get_operation().deref(ctx).get_result(0);
+    let alloca_fact = LegacyType::pointer_to_llvm(ctx, operand_ty, 0);
+    set_value_type_fact(ctx, alloca_ptr, alloca_fact);
 
     let store = llvm::StoreOp::new(ctx, operand, alloca_ptr);
     copy_alignment(ctx, op, store.get_operation());
@@ -251,6 +272,15 @@ pub(crate) fn convert_ptr_offset(
         vec![llvm_export::ops::GepIndex::Value(offset)],
         elem_ty,
     );
+    let addrspace = ptr
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<llvm_export::types::PointerType>()
+        .map_or(0, llvm_export::types::PointerType::address_space);
+    let ptr_fact = LegacyType::pointer_to_llvm(ctx, elem_ty, addrspace);
+    set_value_type_fact(ctx, ptr, ptr_fact.clone());
+    let gep_res = llvm_gep.get_operation().deref(ctx).get_result(0);
+    set_value_type_fact(ctx, gep_res, ptr_fact);
     rewriter.insert_operation(ctx, llvm_gep.get_operation());
     rewriter.replace_operation(ctx, op, llvm_gep.get_operation());
 

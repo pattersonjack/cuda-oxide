@@ -90,12 +90,12 @@ impl<'a> ModuleExportState<'a> {
                 "@{name} = external addrspace({address_space}) global "
             )
             .unwrap();
-            self.export_type(ty, output)?;
+            self.export_type_without_value(ty, output)?;
             writeln!(output, ", align {alignment}").unwrap();
         } else {
             // Internal linkage: static storage in the global's address space.
             write!(output, "@{name} = addrspace({address_space}) global ").unwrap();
-            self.export_type(ty, output)?;
+            self.export_type_without_value(ty, output)?;
             writeln!(output, " zeroinitializer, align {alignment}").unwrap();
         }
 
@@ -193,15 +193,20 @@ impl<'a> ModuleExportState<'a> {
         if func.get_operation().deref(self.ctx).regions().count() == 0 {
             // Function Declaration
             write!(output, "declare ").unwrap();
-            self.export_type(ret_ty, output)?;
+            self.export_type_without_value(ret_ty, output)?;
             write!(output, " @{fixed_func_name}(").unwrap();
 
             let args = func_ty.arg_types();
+            if self.uses_legacy_typed_pointers() {
+                let function_ref = self.legacy_decl_function_ref(&fixed_func_name, ret_ty, &args);
+                self.function_refs
+                    .insert(fixed_func_name.clone(), function_ref);
+            }
             for (i, arg_ty) in args.iter().enumerate() {
                 if i > 0 {
                     write!(output, ", ").unwrap();
                 }
-                self.export_type(*arg_ty, output)?;
+                self.export_type_without_value(*arg_ty, output)?;
             }
             write!(output, ")").unwrap();
 
@@ -227,18 +232,27 @@ impl<'a> ModuleExportState<'a> {
             .next();
 
         if let Some(entry_block) = entry_block_opt {
+            let block_labels = super::typed::build_block_labels(self.ctx, func, entry_block);
+            let pred_map = super::typed::build_predecessor_map(self.ctx, func);
+            self.legacy_type_facts = self.analyze_legacy_type_facts(func, &pred_map);
+
             write!(output, "define ").unwrap();
             if is_kernel && self.emit_ptx_kernel_keyword {
                 write!(output, "ptx_kernel ").unwrap();
             }
-            self.export_type(ret_ty, output)?;
+            self.export_type_without_value(ret_ty, output)?;
             write!(output, " @{fixed_func_name}(").unwrap();
 
             let mut value_names = HashMap::new();
             let mut next_value_id = 0;
 
             let block = entry_block.deref(self.ctx);
-            let args = block.arguments();
+            let args: Vec<_> = block.arguments().collect();
+            if self.uses_legacy_typed_pointers() {
+                let function_ref = self.legacy_function_ref(&fixed_func_name, ret_ty, &args);
+                self.function_refs
+                    .insert(fixed_func_name.clone(), function_ref);
+            }
             // Parameters are emitted bare: `<type> %vN` with no LLVM parameter
             // attributes (no `noalias`, `nocapture`, `dereferenceable`, etc.).
             // This is deliberate and load-bearing for `DisjointSlice`.
@@ -255,14 +269,13 @@ impl<'a> ModuleExportState<'a> {
             // that double-constructed a `DisjointSlice` starts seeing folded
             // writes / reordered reads on PTX. Don't add parameter attributes
             // here without re-auditing the `from_raw_parts` callers.
-            for (i, arg) in args.enumerate() {
+            for (i, arg) in args.iter().enumerate() {
                 if i > 0 {
                     write!(output, ", ").unwrap();
                 }
-                let arg_ty = arg.get_type(self.ctx);
-                self.export_type(arg_ty, output)?;
+                self.export_value_type(*arg, output)?;
                 let name = format!("%v{next_value_id}");
-                value_names.insert(arg, name.clone());
+                value_names.insert(*arg, name.clone());
                 write!(output, " {name}").unwrap();
                 next_value_id += 1;
             }
@@ -276,27 +289,6 @@ impl<'a> ModuleExportState<'a> {
             // functions it proves never reach a convergent op.
             writeln!(output, ") #0 {{").unwrap();
             self.convergent_used = true;
-
-            // Assign labels to all blocks
-            let mut block_labels = HashMap::new();
-            let mut next_label_id = 0;
-            for (i, block_node) in func
-                .get_operation()
-                .deref(self.ctx)
-                .get_region(0)
-                .deref(self.ctx)
-                .iter(self.ctx)
-                .enumerate()
-            {
-                if i == 0 {
-                    // Entry block usually doesn't need label in LLVM if it's first
-                    block_labels.insert(block_node, "entry".to_string());
-                } else {
-                    let label = format!("bb{next_label_id}");
-                    next_label_id += 1;
-                    block_labels.insert(block_node, label);
-                }
-            }
 
             // PRE-PASS: Assign names to ALL values before exporting.
             // This is needed because PHI nodes may reference values from blocks that
@@ -383,54 +375,6 @@ impl<'a> ModuleExportState<'a> {
                 }
             }
 
-            // Build predecessor map for PHI generation
-            let mut pred_map: PredecessorMap = HashMap::new();
-            for block in func
-                .get_operation()
-                .deref(self.ctx)
-                .get_region(0)
-                .deref(self.ctx)
-                .iter(self.ctx)
-            {
-                let block_ref = block.deref(self.ctx);
-                if let Some(term) = block_ref.iter(self.ctx).last() {
-                    let term_obj = Operation::get_op_dyn(term, self.ctx);
-                    let term_dyn = term_obj.as_ref();
-
-                    if term_dyn.downcast_ref::<ops::BrOp>().is_some() {
-                        // BrOp has 1 successor and all operands are passed to it
-                        let dest = term.deref(self.ctx).successors().next().unwrap();
-                        let args: Vec<_> = term.deref(self.ctx).operands().collect();
-                        pred_map.entry(dest).or_default().push((block, args));
-                    } else if term_dyn.downcast_ref::<ops::CondBrOp>().is_some() {
-                        let succs: Vec<_> = term.deref(self.ctx).successors().collect();
-                        let true_dest = succs[0];
-                        let false_dest = succs[1];
-
-                        // Calculate split point for operands
-                        // [cond, true_args..., false_args...]
-                        let num_true = true_dest.deref(self.ctx).arguments().count();
-                        let num_false = false_dest.deref(self.ctx).arguments().count();
-
-                        let all_ops: Vec<_> = term.deref(self.ctx).operands().collect();
-                        if all_ops.len() >= 1 + num_true + num_false {
-                            let true_args = all_ops[1..=num_true].to_vec();
-                            let false_args =
-                                all_ops[1 + num_true..1 + num_true + num_false].to_vec();
-
-                            pred_map
-                                .entry(true_dest)
-                                .or_default()
-                                .push((block, true_args));
-                            pred_map
-                                .entry(false_dest)
-                                .or_default()
-                                .push((block, false_args));
-                        }
-                    }
-                }
-            }
-
             // Export blocks
             for (i, block_node) in func
                 .get_operation()
@@ -456,15 +400,20 @@ impl<'a> ModuleExportState<'a> {
             // get_num_regions() >= 1 but the first region has no entry block (empty function).
             // Treat it as a declaration.
             write!(output, "declare ").unwrap();
-            self.export_type(ret_ty, output)?;
+            self.export_type_without_value(ret_ty, output)?;
             write!(output, " @{fixed_func_name}(").unwrap();
 
             let args = func_ty.arg_types();
+            if self.uses_legacy_typed_pointers() {
+                let function_ref = self.legacy_decl_function_ref(&fixed_func_name, ret_ty, &args);
+                self.function_refs
+                    .insert(fixed_func_name.clone(), function_ref);
+            }
             for (i, arg_ty) in args.iter().enumerate() {
                 if i > 0 {
                     write!(output, ", ").unwrap();
                 }
-                self.export_type(*arg_ty, output)?;
+                self.export_type_without_value(*arg_ty, output)?;
             }
             writeln!(output, ")").unwrap();
         }
@@ -507,7 +456,7 @@ impl<'a> ModuleExportState<'a> {
                 };
 
                 write!(output, "  {arg_name} = phi ").unwrap();
-                self.export_type(arg.get_type(self.ctx), output)?;
+                self.export_value_type(*arg, output)?;
                 write!(output, " ").unwrap();
 
                 for (i, (pred_block, pred_args)) in preds.iter().enumerate() {

@@ -11,11 +11,18 @@ use pliron::{
     builtin::types::{FP32Type, FP64Type, IntegerType},
     context::Ptr,
     r#type::TypeObj,
+    r#type::Typed,
 };
 
 use crate::types::{HalfType, PointerType, StructType, VoidType};
 
 use super::state::ModuleExportState;
+
+pub(super) fn addrspace_of_type(ty: Ptr<TypeObj>, ctx: &pliron::context::Context) -> u32 {
+    ty.deref(ctx)
+        .downcast_ref::<PointerType>()
+        .map_or(0, PointerType::address_space)
+}
 
 impl<'a> ModuleExportState<'a> {
     pub(super) fn export_type(&self, ty: Ptr<TypeObj>, output: &mut String) -> Result<(), String> {
@@ -58,6 +65,77 @@ impl<'a> ModuleExportState<'a> {
             write!(output, "void /* unknown: {} */", ty_ref.disp(self.ctx)).unwrap();
         }
         Ok(())
+    }
+
+    pub(super) fn export_type_without_value(
+        &self,
+        ty: Ptr<TypeObj>,
+        output: &mut String,
+    ) -> Result<(), String> {
+        if self.uses_legacy_typed_pointers() {
+            crate::pointer_facts::LegacyType::from_llvm_type(self.ctx, ty)
+                .write_llvm(self.ctx, output);
+            Ok(())
+        } else {
+            self.export_type(ty, output)
+        }
+    }
+
+    pub(super) fn export_value_type(
+        &self,
+        val: pliron::value::Value,
+        output: &mut String,
+    ) -> Result<(), String> {
+        if self.uses_legacy_typed_pointers()
+            && let Some(fact) = self.legacy_fact(val)
+        {
+            fact.write_llvm(self.ctx, output);
+            Ok(())
+        } else {
+            self.export_type_without_value(val.get_type(self.ctx), output)
+        }
+    }
+
+    pub(super) fn legacy_function_ref(
+        &self,
+        name: &str,
+        ret_ty: Ptr<TypeObj>,
+        args: &[pliron::value::Value],
+    ) -> String {
+        let mut output = String::new();
+        self.export_type_without_value(ret_ty, &mut output)
+            .expect("type printing cannot fail");
+        output.push_str(" (");
+        for (i, arg) in args.iter().enumerate() {
+            if i > 0 {
+                output.push_str(", ");
+            }
+            self.export_value_type(*arg, &mut output)
+                .expect("type printing cannot fail");
+        }
+        write!(output, ")* @{name}").unwrap();
+        output
+    }
+
+    pub(super) fn legacy_decl_function_ref(
+        &self,
+        name: &str,
+        ret_ty: Ptr<TypeObj>,
+        arg_tys: &[Ptr<TypeObj>],
+    ) -> String {
+        let mut output = String::new();
+        self.export_type_without_value(ret_ty, &mut output)
+            .expect("type printing cannot fail");
+        output.push_str(" (");
+        for (i, arg_ty) in arg_tys.iter().enumerate() {
+            if i > 0 {
+                output.push_str(", ");
+            }
+            self.export_type_without_value(*arg_ty, &mut output)
+                .expect("type printing cannot fail");
+        }
+        write!(output, ")* @{name}").unwrap();
+        output
     }
 
     /// Compute conservative ABI alignment (bytes) for a type.

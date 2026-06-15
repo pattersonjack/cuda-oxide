@@ -4,20 +4,62 @@
  */
 
 use llvm_export::{
-    export::export_module_to_string,
+    export::{
+        NvvmLegacyExportConfig, export_module_to_string, export_module_to_string_with_config,
+    },
     ops::{AddressOfOp, BrOp, FuncOp, GepIndex, GetElementPtrOp, GlobalOp, InlineAsmOp, ReturnOp},
-    types::{FuncType, VoidType},
+    types::{FuncType, PointerType, VoidType},
 };
 use pliron::{
     basic_block::BasicBlock,
     builtin::{
         ops::ModuleOp,
-        types::{IntegerType, Signedness},
+        types::{FP64Type, IntegerType, Signedness},
     },
     context::Context,
     linked_list::ContainsLinkedList,
     op::Op,
 };
+
+#[test]
+fn legacy_nvvm_export_infers_typed_pointer_argument_from_load() {
+    let mut ctx = Context::new();
+
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_region = module.get_operation().deref(&ctx).get_region(0);
+    let module_block = module_region.deref(&ctx).iter(&ctx).next().unwrap();
+
+    let void_ty = VoidType::get(&ctx);
+    let ptr_ty = PointerType::get(&mut ctx, 0);
+    let func_ty = FuncType::get(&mut ctx, void_ty.to_ptr(), vec![ptr_ty.into()], false);
+    let func = FuncOp::new(&mut ctx, "loads_double".try_into().unwrap(), func_ty);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    let arg = entry.deref(&ctx).get_argument(0);
+
+    let double_ty = FP64Type::get(&ctx);
+    let load = llvm_export::ops::LoadOp::new(&mut ctx, arg, double_ty.into());
+    load.get_operation().insert_at_back(entry, &ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let ir = export_module_to_string_with_config(&ctx, &module, &NvvmLegacyExportConfig)
+        .expect("legacy export succeeds");
+
+    assert!(
+        ir.contains("define void @loads_double(double* %v0)"),
+        "legacy NVVM export must type function pointer args from use facts:\n{ir}"
+    );
+    assert!(
+        ir.contains("load double, double* %v0"),
+        "legacy NVVM export must type memory operands:\n{ir}"
+    );
+    assert!(
+        !ir.contains(" ptr"),
+        "legacy NVVM export must not emit opaque pointer spelling:\n{ir}"
+    );
+}
 
 #[test]
 fn export_addressof_uses_symbol_when_definition_block_prints_later() {

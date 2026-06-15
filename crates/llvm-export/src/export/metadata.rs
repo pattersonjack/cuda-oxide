@@ -32,10 +32,11 @@ pub(super) fn emit_nvvm_annotations(
     if emit_all_annotations {
         for kernel in state.all_kernels.iter() {
             if !special_kernel_names.contains(kernel.name.as_str()) {
+                let kernel_ref = state.metadata_function_ref(&kernel.name);
                 writeln!(
                     output,
-                    "!{} = !{{ptr @{}, !\"kernel\", i32 1}}",
-                    md_id, kernel.name
+                    "!{} = !{{{}, !\"kernel\", i32 1}}",
+                    md_id, kernel_ref
                 )
                 .unwrap();
                 metadata_refs.push(format!("!{}", md_id));
@@ -46,10 +47,11 @@ pub(super) fn emit_nvvm_annotations(
 
     // Emit cluster config annotations
     for cfg in state.cluster_kernels.iter() {
+        let kernel_ref = state.metadata_function_ref(&cfg.name);
         writeln!(
             output,
-            "!{} = !{{ptr @{}, !\"kernel\", i32 1, !\"cluster_dim_x\", i32 {}, !\"cluster_dim_y\", i32 {}, !\"cluster_dim_z\", i32 {}}}",
-            md_id, cfg.name, cfg.dim_x, cfg.dim_y, cfg.dim_z
+            "!{} = !{{{}, !\"kernel\", i32 1, !\"cluster_dim_x\", i32 {}, !\"cluster_dim_y\", i32 {}, !\"cluster_dim_z\", i32 {}}}",
+            md_id, kernel_ref, cfg.dim_x, cfg.dim_y, cfg.dim_z
         )
         .unwrap();
         metadata_refs.push(format!("!{}", md_id));
@@ -58,18 +60,19 @@ pub(super) fn emit_nvvm_annotations(
 
     // Emit launch bounds annotations
     for bounds in state.launch_bounds_kernels.iter() {
+        let kernel_ref = state.metadata_function_ref(&bounds.name);
         if let Some(min_blocks) = bounds.min_blocks {
             writeln!(
                 output,
-                "!{} = !{{ptr @{}, !\"kernel\", i32 1, !\"maxntidx\", i32 {}, !\"minctasm\", i32 {}}}",
-                md_id, bounds.name, bounds.max_threads, min_blocks
+                "!{} = !{{{}, !\"kernel\", i32 1, !\"maxntidx\", i32 {}, !\"minctasm\", i32 {}}}",
+                md_id, kernel_ref, bounds.max_threads, min_blocks
             )
             .unwrap();
         } else {
             writeln!(
                 output,
-                "!{} = !{{ptr @{}, !\"kernel\", i32 1, !\"maxntidx\", i32 {}}}",
-                md_id, bounds.name, bounds.max_threads
+                "!{} = !{{{}, !\"kernel\", i32 1, !\"maxntidx\", i32 {}}}",
+                md_id, kernel_ref, bounds.max_threads
             )
             .unwrap();
         }

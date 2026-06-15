@@ -28,6 +28,7 @@ use crate::{
         ICmpPredicateAttr,
     },
     ops,
+    pointer_facts::LegacyType,
     types::{FuncType, VoidType},
 };
 
@@ -387,7 +388,7 @@ impl<'a> ModuleExportState<'a> {
             write!(output, "void").unwrap();
         } else {
             let val = op_ref.operands().next().unwrap();
-            self.export_type(val.get_type(self.ctx), output)?;
+            self.export_value_type(val, output)?;
             write!(output, " ").unwrap();
             self.export_value(val, value_names, output)?;
         }
@@ -440,11 +441,11 @@ impl<'a> ModuleExportState<'a> {
         let ptr = op_ref.get_operand(0);
         let res_name = value_names.get(&res).unwrap();
         let ty = res.get_type(self.ctx);
-        let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
 
         write!(output, "  {res_name} = load ").unwrap();
-        self.export_type(ty, output)?;
-        write!(output, ", {}", ptr_qualifier(addrspace)).unwrap();
+        self.export_value_type(res, output)?;
+        write!(output, ", ").unwrap();
+        self.export_pointer_to_value(ptr, res, output)?;
         self.export_value(ptr, value_names, output)?;
         let align = crate::ops::op_alignment(self.ctx, op.get_operation())
             .unwrap_or_else(|| self.natural_alignment(ty));
@@ -462,13 +463,13 @@ impl<'a> ModuleExportState<'a> {
         let val = op_ref.get_operand(0);
         let ptr = op_ref.get_operand(1);
         let val_ty = val.get_type(self.ctx);
-        let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
 
         write!(output, "  store ").unwrap();
-        self.export_type(val_ty, output)?;
+        self.export_value_type(val, output)?;
         write!(output, " ").unwrap();
         self.export_value(val, value_names, output)?;
-        write!(output, ", {}", ptr_qualifier(addrspace)).unwrap();
+        write!(output, ", ").unwrap();
+        self.export_pointer_to_value(ptr, val, output)?;
         self.export_value(ptr, value_names, output)?;
         let align = crate::ops::op_alignment(self.ctx, op.get_operation())
             .unwrap_or_else(|| self.natural_alignment(val_ty));
@@ -491,7 +492,7 @@ impl<'a> ModuleExportState<'a> {
 
         let elem_llvm_ty = elem_ty.get_type(self.ctx);
         write!(output, "  {res_name} = alloca ").unwrap();
-        self.export_type(elem_llvm_ty, output)?;
+        self.export_type_without_value(elem_llvm_ty, output)?;
         let align = crate::ops::op_alignment(self.ctx, op.get_operation())
             .unwrap_or_else(|| self.natural_alignment(elem_llvm_ty));
         writeln!(output, ", align {align}").unwrap();
@@ -512,11 +513,11 @@ impl<'a> ModuleExportState<'a> {
             .get_attr_gep_src_elem_type(self.ctx)
             .expect("Missing gep_src_elem_type")
             .get_type(self.ctx);
-        let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
 
         write!(output, "  {res_name} = getelementptr inbounds ").unwrap();
-        self.export_type(elem_ty, output)?;
-        write!(output, ", {}", ptr_qualifier(addrspace)).unwrap();
+        self.export_gep_source_element(ptr, elem_ty, output)?;
+        write!(output, ", ").unwrap();
+        self.export_pointer_to_gep_source(ptr, elem_ty, output)?;
         self.export_value(ptr, value_names, output)?;
 
         for idx_attr in &op.get_attr_gep_indices(self.ctx).unwrap().0 {
@@ -527,7 +528,7 @@ impl<'a> ModuleExportState<'a> {
                 }
                 GepIndexAttr::OperandIdx(operand_idx) => {
                     let val = op_ref.get_operand(*operand_idx);
-                    self.export_type(val.get_type(self.ctx), output)?;
+                    self.export_value_type(val, output)?;
                     write!(output, " ").unwrap();
                     self.export_value(val, value_names, output)?;
                 }
@@ -550,11 +551,11 @@ impl<'a> ModuleExportState<'a> {
         let ty = res.get_type(self.ctx);
         let syncscope = fmt_syncscope(op.get_attr_llvm_ld_syncscope(self.ctx));
         let ordering = fmt_ordering(op.get_attr_llvm_ld_ordering(self.ctx));
-        let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
 
         write!(output, "  {res_name} = load atomic ").unwrap();
-        self.export_type(ty, output)?;
-        write!(output, ", {}", ptr_qualifier(addrspace)).unwrap();
+        self.export_value_type(res, output)?;
+        write!(output, ", ").unwrap();
+        self.export_pointer_to_value(ptr, res, output)?;
         self.export_value(ptr, value_names, output)?;
         let align = self.natural_alignment(ty);
         writeln!(output, "{syncscope} {ordering}, align {align}").unwrap();
@@ -572,13 +573,13 @@ impl<'a> ModuleExportState<'a> {
         let ptr = op_ref.get_operand(1);
         let syncscope = fmt_syncscope(op.get_attr_llvm_st_syncscope(self.ctx));
         let ordering = fmt_ordering(op.get_attr_llvm_st_ordering(self.ctx));
-        let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
 
         write!(output, "  store atomic ").unwrap();
-        self.export_type(val.get_type(self.ctx), output)?;
+        self.export_value_type(val, output)?;
         write!(output, " ").unwrap();
         self.export_value(val, value_names, output)?;
-        write!(output, ", {}", ptr_qualifier(addrspace)).unwrap();
+        write!(output, ", ").unwrap();
+        self.export_pointer_to_value(ptr, val, output)?;
         self.export_value(ptr, value_names, output)?;
         let align = self.natural_alignment(val.get_type(self.ctx));
         writeln!(output, "{syncscope} {ordering}, align {align}").unwrap();
@@ -599,13 +600,12 @@ impl<'a> ModuleExportState<'a> {
         let rmw_kind = fmt_rmw_kind(op.get_attr_llvm_rmw_kind(self.ctx));
         let syncscope = fmt_syncscope(op.get_attr_llvm_rmw_syncscope(self.ctx));
         let ordering = fmt_ordering(op.get_attr_llvm_rmw_ordering(self.ctx));
-        let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
 
         write!(output, "  {res_name} = atomicrmw {rmw_kind} ").unwrap();
-        write!(output, "{}", ptr_qualifier(addrspace)).unwrap();
+        self.export_pointer_to_value(ptr, val, output)?;
         self.export_value(ptr, value_names, output)?;
         write!(output, ", ").unwrap();
-        self.export_type(val.get_type(self.ctx), output)?;
+        self.export_value_type(val, output)?;
         write!(output, " ").unwrap();
         self.export_value(val, value_names, output)?;
         writeln!(output, "{syncscope} {ordering}").unwrap();
@@ -627,21 +627,19 @@ impl<'a> ModuleExportState<'a> {
         let success_ord = fmt_ordering(op.get_attr_llvm_cas_success_ordering(self.ctx));
         let failure_ord = fmt_ordering(op.get_attr_llvm_cas_failure_ordering(self.ctx));
         let syncscope = fmt_syncscope(op.get_attr_llvm_cas_syncscope(self.ctx));
-        let val_ty = cmp.get_type(self.ctx);
-        let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
 
         // pliron-llvm's cmpxchg result is the full `{ T, i1 }` struct; a
         // separate `extractvalue` op (emitted on its own) pulls out the loaded
         // value, so here we emit only the cmpxchg into the struct-typed result.
         write!(output, "  {res_name} = cmpxchg ").unwrap();
-        write!(output, "{}", ptr_qualifier(addrspace)).unwrap();
+        self.export_pointer_to_value(ptr, cmp, output)?;
         self.export_value(ptr, value_names, output)?;
         write!(output, ", ").unwrap();
-        self.export_type(val_ty, output)?;
+        self.export_value_type(cmp, output)?;
         write!(output, " ").unwrap();
         self.export_value(cmp, value_names, output)?;
         write!(output, ", ").unwrap();
-        self.export_type(val_ty, output)?;
+        self.export_value_type(new_val, output)?;
         write!(output, " ").unwrap();
         self.export_value(new_val, value_names, output)?;
         writeln!(output, "{syncscope} {success_ord} {failure_ord}").unwrap();
@@ -667,7 +665,7 @@ impl<'a> ModuleExportState<'a> {
         let arg = op_ref.get_operand(0);
 
         write!(output, "  {res_name} = fneg ").unwrap();
-        self.export_type(arg.get_type(self.ctx), output)?;
+        self.export_value_type(arg, output)?;
         write!(output, " ").unwrap();
         self.export_value(arg, value_names, output)?;
         writeln!(output).unwrap();
@@ -699,7 +697,7 @@ impl<'a> ModuleExportState<'a> {
         };
 
         write!(output, "  {res_name} = icmp {pred} ").unwrap();
-        self.export_type(lhs.get_type(self.ctx), output)?;
+        self.export_value_type(lhs, output)?;
         write!(output, " ").unwrap();
         self.export_value(lhs, value_names, output)?;
         write!(output, ", ").unwrap();
@@ -739,7 +737,7 @@ impl<'a> ModuleExportState<'a> {
         };
 
         write!(output, "  {res_name} = fcmp {pred} ").unwrap();
-        self.export_type(lhs.get_type(self.ctx), output)?;
+        self.export_value_type(lhs, output)?;
         write!(output, " ").unwrap();
         self.export_value(lhs, value_names, output)?;
         write!(output, ", ").unwrap();
@@ -760,16 +758,15 @@ impl<'a> ModuleExportState<'a> {
         let cond = op_ref.get_operand(0);
         let true_val = op_ref.get_operand(1);
         let false_val = op_ref.get_operand(2);
-        let val_ty = true_val.get_type(self.ctx);
 
         write!(output, "  {res_name} = select i1 ").unwrap();
         self.export_value(cond, value_names, output)?;
         write!(output, ", ").unwrap();
-        self.export_type(val_ty, output)?;
+        self.export_value_type(true_val, output)?;
         write!(output, " ").unwrap();
         self.export_value(true_val, value_names, output)?;
         write!(output, ", ").unwrap();
-        self.export_type(val_ty, output)?;
+        self.export_value_type(false_val, output)?;
         write!(output, " ").unwrap();
         self.export_value(false_val, value_names, output)?;
         writeln!(output).unwrap();
@@ -798,7 +795,7 @@ impl<'a> ModuleExportState<'a> {
             let res = op_ref.get_result(0);
             let res_name = value_names.get(&res).unwrap();
             write!(output, "  {res_name} = call ").unwrap();
-            self.export_type(ret_ty, output)?;
+            self.export_value_type(res, output)?;
         }
 
         match callee {
@@ -823,7 +820,7 @@ impl<'a> ModuleExportState<'a> {
             if i > 0 {
                 write!(output, ", ").unwrap();
             }
-            self.export_type(arg.get_type(self.ctx), output)?;
+            self.export_value_type(arg, output)?;
             write!(output, " ").unwrap();
             self.export_value(arg, value_names, output)?;
         }
@@ -860,7 +857,7 @@ impl<'a> ModuleExportState<'a> {
         } else {
             let res_name = value_names.get(&res).unwrap();
             write!(output, "  {res_name} = call ").unwrap();
-            self.export_type(res_ty, output)?;
+            self.export_value_type(res, output)?;
         }
 
         write!(output, " asm").unwrap();
@@ -874,7 +871,7 @@ impl<'a> ModuleExportState<'a> {
             if i > 0 {
                 write!(output, ", ").unwrap();
             }
-            self.export_type(arg.get_type(self.ctx), output)?;
+            self.export_value_type(arg, output)?;
             write!(output, " ").unwrap();
             self.export_value(arg, value_names, output)?;
         }
@@ -910,11 +907,11 @@ impl<'a> ModuleExportState<'a> {
         if nneg {
             write!(output, "nneg ").unwrap();
         }
-        self.export_type(val.get_type(self.ctx), output)?;
+        self.export_value_type(val, output)?;
         write!(output, " ").unwrap();
         self.export_value(val, value_names, output)?;
         write!(output, " to ").unwrap();
-        self.export_type(res.get_type(self.ctx), output)?;
+        self.export_value_type(res, output)?;
         writeln!(output).unwrap();
         Ok(())
     }
@@ -931,7 +928,7 @@ impl<'a> ModuleExportState<'a> {
         let agg = op_ref.get_operand(0);
 
         write!(output, "  {res_name} = extractvalue ").unwrap();
-        self.export_type(agg.get_type(self.ctx), output)?;
+        self.export_value_type(agg, output)?;
         write!(output, " ").unwrap();
         self.export_value(agg, value_names, output)?;
         for idx in op.indices(self.ctx) {
@@ -954,11 +951,11 @@ impl<'a> ModuleExportState<'a> {
         let val = op_ref.get_operand(1);
 
         write!(output, "  {res_name} = insertvalue ").unwrap();
-        self.export_type(agg.get_type(self.ctx), output)?;
+        self.export_value_type(res, output)?;
         write!(output, " ").unwrap();
         self.export_value(agg, value_names, output)?;
         write!(output, ", ").unwrap();
-        self.export_type(val.get_type(self.ctx), output)?;
+        self.export_value_type(val, output)?;
         write!(output, " ").unwrap();
         self.export_value(val, value_names, output)?;
         for idx in op.indices(self.ctx) {
@@ -1028,7 +1025,7 @@ impl<'a> ModuleExportState<'a> {
         let res_name = value_names.get(&res).unwrap();
 
         write!(output, "  {res_name} = {op_name} ").unwrap();
-        self.export_type(lhs.get_type(self.ctx), output)?;
+        self.export_value_type(lhs, output)?;
         write!(output, " ").unwrap();
         self.export_value(lhs, value_names, output)?;
         write!(output, ", ").unwrap();
@@ -1051,12 +1048,71 @@ impl<'a> ModuleExportState<'a> {
         let res_name = value_names.get(&res).unwrap();
 
         write!(output, "  {res_name} = {op_name} ").unwrap();
-        self.export_type(val.get_type(self.ctx), output)?;
+        self.export_value_type(val, output)?;
         write!(output, " ").unwrap();
         self.export_value(val, value_names, output)?;
         write!(output, " to ").unwrap();
-        self.export_type(res.get_type(self.ctx), output)?;
+        self.export_value_type(res, output)?;
         writeln!(output).unwrap();
+        Ok(())
+    }
+
+    fn export_pointer_to_value(
+        &self,
+        ptr: Value,
+        pointee_val: Value,
+        output: &mut String,
+    ) -> Result<(), String> {
+        if self.uses_legacy_typed_pointers() {
+            let pointee = self.legacy_fact(pointee_val).cloned().unwrap_or_else(|| {
+                LegacyType::from_llvm_type(self.ctx, pointee_val.get_type(self.ctx))
+            });
+            let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
+            LegacyType::pointer_to(pointee, addrspace).write_llvm(self.ctx, output);
+            write!(output, " ").unwrap();
+        } else {
+            let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
+            write!(output, "{}", ptr_qualifier(addrspace)).unwrap();
+        }
+        Ok(())
+    }
+
+    fn gep_source_fact(&self, ptr: Value, elem_ty: Ptr<pliron::r#type::TypeObj>) -> LegacyType {
+        self.legacy_fact(ptr)
+            .and_then(|fact| fact.as_pointer().and_then(|(_, pointee)| pointee.cloned()))
+            .unwrap_or_else(|| LegacyType::from_llvm_type(self.ctx, elem_ty))
+    }
+
+    fn export_gep_source_element(
+        &self,
+        ptr: Value,
+        elem_ty: Ptr<pliron::r#type::TypeObj>,
+        output: &mut String,
+    ) -> Result<(), String> {
+        if self.uses_legacy_typed_pointers() {
+            self.gep_source_fact(ptr, elem_ty)
+                .write_llvm(self.ctx, output);
+        } else {
+            self.export_type(elem_ty, output)?;
+        }
+        Ok(())
+    }
+
+    fn export_pointer_to_gep_source(
+        &self,
+        ptr: Value,
+        elem_ty: Ptr<pliron::r#type::TypeObj>,
+        output: &mut String,
+    ) -> Result<(), String> {
+        if self.uses_legacy_typed_pointers() {
+            let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
+            LegacyType::pointer_to(self.gep_source_fact(ptr, elem_ty), addrspace)
+                .write_llvm(self.ctx, output);
+            write!(output, " ").unwrap();
+        } else {
+            let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
+            write!(output, "{}", ptr_qualifier(addrspace)).unwrap();
+        }
         Ok(())
     }
 

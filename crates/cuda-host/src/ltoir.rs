@@ -199,7 +199,17 @@ pub fn link_ltoir_to_cubin(
 ) -> Result<Vec<u8>, LtoirError> {
     let nvj = LibNvJitLink::load()?;
     let arch_opt = format!("-arch={arch}");
-    let mut linker = Linker::new(&nvj, &[&arch_opt, "-lto"])?;
+    let mut linker = Linker::new(
+        &nvj,
+        &[
+            &arch_opt,
+            "-lto",
+            "-ftz=0",
+            "-prec-div=1",
+            "-prec-sqrt=1",
+            "-fma=0",
+        ],
+    )?;
     linker.add(InputType::Ltoir, ltoir, module_name)?;
     Ok(linker.finish()?)
 }
@@ -228,7 +238,14 @@ fn compile_nvvm_ir_to_ltoir(
     prog.add_module(nvvm_ir, module_name)?;
 
     let arch_opt = format!("-arch={arch_compute}");
-    Ok(prog.compile(&[&arch_opt, "-gen-lto"])?)
+    Ok(prog.compile(&[
+        &arch_opt,
+        "-gen-lto",
+        "-ftz=0",
+        "-prec-div=1",
+        "-prec-sqrt=1",
+        "-fma=0",
+    ])?)
 }
 
 // ============================================================================

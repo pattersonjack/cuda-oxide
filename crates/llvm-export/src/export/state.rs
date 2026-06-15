@@ -8,6 +8,10 @@
 use pliron::{basic_block::BasicBlock, context::Ptr, value::Value};
 use std::collections::HashMap;
 
+use crate::pointer_facts::{LegacyType, ValueFacts};
+
+use super::config::PointerMode;
+
 /// Map from block to its predecessors with the values passed to each predecessor.
 /// Used for PHI node generation when exporting to LLVM IR.
 pub(super) type PredecessorMap = HashMap<Ptr<BasicBlock>, Vec<(Ptr<BasicBlock>, Vec<Value>)>>;
@@ -34,6 +38,12 @@ pub(super) struct KernelInfo {
 
 pub(super) struct ModuleExportState<'a> {
     pub(super) ctx: &'a pliron::context::Context,
+    /// Pointer syntax expected by the selected backend.
+    pub(super) pointer_mode: PointerMode,
+    /// Per-function value type facts used in legacy typed-pointer mode.
+    pub(super) legacy_type_facts: ValueFacts,
+    /// Function symbol references keyed by exported symbol name.
+    pub(super) function_refs: HashMap<String, String>,
     /// Track if any convergent operations were used (for emitting attributes section)
     pub(super) convergent_used: bool,
     /// Track kernels with cluster configurations for nvvm.annotations metadata
@@ -55,9 +65,13 @@ impl<'a> ModuleExportState<'a> {
         ctx: &'a pliron::context::Context,
         track_all_kernels: bool,
         emit_ptx_kernel_keyword: bool,
+        pointer_mode: PointerMode,
     ) -> Self {
         Self {
             ctx,
+            pointer_mode,
+            legacy_type_facts: HashMap::new(),
+            function_refs: HashMap::new(),
             convergent_used: false,
             cluster_kernels: Vec::new(),
             launch_bounds_kernels: Vec::new(),
@@ -85,5 +99,45 @@ impl<'a> ModuleExportState<'a> {
             || name.starts_with("llvm.nvvm.vote")
             // Async bulk operations (TMA)
             || name.starts_with("llvm.nvvm.cp.async.bulk")
+    }
+
+    pub(super) fn uses_legacy_typed_pointers(&self) -> bool {
+        self.pointer_mode == PointerMode::LegacyTyped
+    }
+
+    pub(super) fn legacy_fact(&self, value: Value) -> Option<&LegacyType> {
+        self.legacy_type_facts.get(&value)
+    }
+
+    pub(super) fn metadata_function_ref(&self, name: &str) -> String {
+        if self.uses_legacy_typed_pointers() {
+            self.function_refs
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| format!("void ()* @{name}"))
+        } else {
+            format!("ptr @{name}")
+        }
+    }
+
+    pub(super) fn llvm_used_entry_type(&self) -> &'static str {
+        if self.uses_legacy_typed_pointers() {
+            "i8*"
+        } else {
+            "ptr"
+        }
+    }
+
+    pub(super) fn llvm_used_entry(&self, name: &str) -> String {
+        if self.uses_legacy_typed_pointers() {
+            let func_ref = self
+                .function_refs
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| format!("void ()* @{name}"));
+            format!("i8* bitcast ({func_ref} to i8*)")
+        } else {
+            format!("ptr @{name}")
+        }
     }
 }

@@ -45,9 +45,12 @@ mod module;
 mod names;
 mod ops;
 mod state;
+mod typed;
 mod types;
 
-pub use config::{ExportBackendConfig, NvvmExportConfig, PtxExportConfig};
+pub use config::{
+    ExportBackendConfig, NvvmExportConfig, NvvmLegacyExportConfig, PointerMode, PtxExportConfig,
+};
 pub use externs::{AsDeviceExtern, DeviceExternAttrs, DeviceExternDecl};
 
 use pliron::{builtin::ops::ModuleOp, context::Context};

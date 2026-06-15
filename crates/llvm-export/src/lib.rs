@@ -275,6 +275,8 @@ pub mod op_interfaces {
     pub use pliron_llvm::op_interfaces::*;
 }
 
+pub mod pointer_facts;
+
 use pliron::builtin::attributes::FPHalfAttr;
 use pliron::utils::apfloat::{Float, Half};
 

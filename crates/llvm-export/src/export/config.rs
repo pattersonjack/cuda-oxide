@@ -40,6 +40,19 @@ pub trait ExportBackendConfig {
 
     /// Whether kernel definitions should use the `ptx_kernel` calling convention.
     fn emit_ptx_kernel_keyword(&self) -> bool;
+
+    /// Pointer syntax expected by the target LLVM/NVVM dialect.
+    fn pointer_mode(&self) -> PointerMode {
+        PointerMode::Opaque
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerMode {
+    /// LLVM opaque pointer syntax (`ptr`, `ptr addrspace(N)`).
+    Opaque,
+    /// LLVM 7 / NVVM 1.x typed pointer syntax (`double*`, `i32 addrspace(3)*`).
+    LegacyTyped,
 }
 
 /// Default PTX export configuration.
@@ -113,5 +126,41 @@ impl ExportBackendConfig for NvvmExportConfig {
 
     fn emit_ptx_kernel_keyword(&self) -> bool {
         false
+    }
+}
+
+/// Export configuration for legacy NVVM IR syntax (LLVM 7 dialect, typed pointers).
+///
+/// This is required by libNVVM when targeting pre-Blackwell architectures.
+#[derive(Clone, Debug, Default)]
+pub struct NvvmLegacyExportConfig;
+
+impl ExportBackendConfig for NvvmLegacyExportConfig {
+    fn datalayout(&self) -> &str {
+        NVPTX_DATALAYOUT_FULL
+    }
+
+    fn emit_llvm_used(&self) -> bool {
+        true
+    }
+
+    fn emit_nvvmir_version(&self) -> bool {
+        true
+    }
+
+    fn nvvmir_version(&self) -> [i32; 4] {
+        [2, 0, 3, 2]
+    }
+
+    fn emit_all_kernel_annotations(&self) -> bool {
+        true
+    }
+
+    fn emit_ptx_kernel_keyword(&self) -> bool {
+        false
+    }
+
+    fn pointer_mode(&self) -> PointerMode {
+        PointerMode::LegacyTyped
     }
 }

@@ -46,6 +46,7 @@ use dialect_mir::types::{
     MirTupleType,
 };
 use llvm_export::ops as llvm;
+use llvm_export::pointer_facts::{LegacyType, set_value_type_fact};
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::irbuild::dialect_conversion::{DialectConversionRewriter, OperandsInfo};
@@ -986,6 +987,17 @@ pub(crate) fn convert_field_addr(
     let gep_indices = vec![GepIndex::Constant(0), GepIndex::Constant(slot)];
 
     let gep_op = llvm::GetElementPtrOp::new(ctx, ptr_operand, gep_indices, map.llvm_struct_ty);
+    let field_ty = map.field_llvm_types[field_index];
+    let addrspace = ptr_operand
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<llvm_export::types::PointerType>()
+        .map_or(0, llvm_export::types::PointerType::address_space);
+    let ptr_fact = LegacyType::pointer_to_llvm(ctx, map.llvm_struct_ty, addrspace);
+    set_value_type_fact(ctx, ptr_operand, ptr_fact);
+    let res_fact = LegacyType::pointer_to_llvm(ctx, field_ty, addrspace);
+    let gep_res = gep_op.get_operation().deref(ctx).get_result(0);
+    set_value_type_fact(ctx, gep_res, res_fact);
     rewriter.insert_operation(ctx, gep_op.get_operation());
     rewriter.replace_operation(ctx, op, gep_op.get_operation());
 
@@ -1035,6 +1047,23 @@ pub(crate) fn convert_array_element_addr(
     let gep_indices = vec![GepIndex::Constant(0), GepIndex::Value(index)];
 
     let gep_op = llvm::GetElementPtrOp::new(ctx, arr_ptr, gep_indices, llvm_array_ty);
+    let element_ty = {
+        let array_ref = llvm_array_ty.deref(ctx);
+        array_ref
+            .downcast_ref::<llvm_export::types::ArrayType>()
+            .expect("converted MirArrayType must be llvm array")
+            .elem_type()
+    };
+    let addrspace = arr_ptr
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<llvm_export::types::PointerType>()
+        .map_or(0, llvm_export::types::PointerType::address_space);
+    let ptr_fact = LegacyType::pointer_to_llvm(ctx, llvm_array_ty, addrspace);
+    set_value_type_fact(ctx, arr_ptr, ptr_fact);
+    let res_fact = LegacyType::pointer_to_llvm(ctx, element_ty, addrspace);
+    let gep_res = gep_op.get_operation().deref(ctx).get_result(0);
+    set_value_type_fact(ctx, gep_res, res_fact);
     rewriter.insert_operation(ctx, gep_op.get_operation());
     rewriter.replace_operation(ctx, op, gep_op.get_operation());
 

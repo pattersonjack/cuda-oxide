@@ -655,9 +655,26 @@ fn export_llvm_ir(
         .ok_or_else(|| PipelineError::Export("Not a module op".to_string()))?;
 
     let llvm_ir = if emit_nvvm_ir {
-        let config = llvm_export::export::NvvmExportConfig;
-        llvm_export::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
+        let arch = nvvm_target_arch();
+        if nvvm_requires_legacy_typed_pointers(&arch) {
+            let config = llvm_export::export::NvvmLegacyExportConfig;
+            llvm_export::export::export_module_with_externs(
+                ctx,
+                &module_op,
+                device_externs,
+                &config,
+            )
             .map_err(PipelineError::Export)?
+        } else {
+            let config = llvm_export::export::NvvmExportConfig;
+            llvm_export::export::export_module_with_externs(
+                ctx,
+                &module_op,
+                device_externs,
+                &config,
+            )
+            .map_err(PipelineError::Export)?
+        }
     } else {
         let config = llvm_export::export::PtxExportConfig;
         llvm_export::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
@@ -667,6 +684,27 @@ fn export_llvm_ir(
     std::fs::write(path, &llvm_ir).map_err(|e| PipelineError::Export(e.to_string()))?;
 
     Ok(llvm_ir)
+}
+
+fn nvvm_target_arch() -> String {
+    std::env::var("CUDA_OXIDE_TARGET")
+        .or_else(|_| std::env::var("CUDA_OXIDE_DEVICE_ARCH"))
+        .unwrap_or_else(|_| "sm_120".to_string())
+}
+
+fn nvvm_requires_legacy_typed_pointers(arch: &str) -> bool {
+    arch_numeric_version(arch).is_some_and(|sm| sm < 100)
+}
+
+fn arch_numeric_version(arch: &str) -> Option<u32> {
+    let suffix = arch
+        .strip_prefix("sm_")
+        .or_else(|| arch.strip_prefix("compute_"))?;
+    let digits: String = suffix
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
 }
 
 /// Checks for WGMMA instructions (Hopper sm_90a only, NOT forward-compatible).

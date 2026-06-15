@@ -36,9 +36,13 @@ use crate::convert::types::{
 use dialect_mir::ops::MirFuncOp;
 use dialect_mir::types::{MirDisjointSliceType, MirPtrType, MirSliceType, MirStructType};
 use llvm_export::ops as llvm;
+use llvm_export::pointer_facts::{LegacyType, set_value_type_fact};
 use pliron::{
     basic_block::BasicBlock,
-    builtin::op_interfaces::SymbolOpInterface,
+    builtin::{
+        op_interfaces::SymbolOpInterface,
+        types::{IntegerType, Signedness},
+    },
     context::{Context, Ptr},
     irbuild::{
         dialect_conversion::{DialectConversionRewriter, OperandsInfo},
@@ -264,8 +268,10 @@ fn build_entry_prologue(
                 let len_val = llvm_args[llvm_arg_idx + 1];
                 llvm_arg_idx += 2;
 
+                seed_slice_data_pointer_fact(ctx, ptr_val, mir_ty)?;
                 let (val, new_last) =
                     reconstruct_slice(ctx, llvm_entry, last_op, mir_ty, ptr_val, len_val)?;
+                seed_value_fact_from_mir_type(ctx, val, mir_ty)?;
                 last_op = Some(new_last);
                 result_args.push(val);
             }
@@ -292,13 +298,93 @@ fn build_entry_prologue(
                         "Entry block arg mismatch: no more LLVM args available"
                     ));
                 }
-                result_args.push(llvm_args[llvm_arg_idx]);
+                let arg = llvm_args[llvm_arg_idx];
+                seed_value_fact_from_mir_type(ctx, arg, mir_ty)?;
+                result_args.push(arg);
                 llvm_arg_idx += 1;
             }
         }
     }
 
     Ok(result_args)
+}
+
+fn seed_value_fact_from_mir_type(
+    ctx: &mut Context,
+    value: Value,
+    mir_ty: Ptr<TypeObj>,
+) -> std::result::Result<(), anyhow::Error> {
+    if let Some(fact) = legacy_fact_from_mir_type(ctx, mir_ty)? {
+        set_value_type_fact(ctx, value, fact);
+    }
+    Ok(())
+}
+
+fn seed_slice_data_pointer_fact(
+    ctx: &mut Context,
+    value: Value,
+    mir_ty: Ptr<TypeObj>,
+) -> std::result::Result<(), anyhow::Error> {
+    let element_ty = {
+        let ty_ref = mir_ty.deref(ctx);
+        ty_ref
+            .downcast_ref::<MirSliceType>()
+            .map(|slice| slice.element_type())
+            .or_else(|| {
+                ty_ref
+                    .downcast_ref::<MirDisjointSliceType>()
+                    .map(|slice| slice.element_type())
+            })
+    };
+
+    if let Some(element_ty) = element_ty {
+        let llvm_element_ty = convert_type(ctx, element_ty)?;
+        let fact = LegacyType::pointer_to_llvm(ctx, llvm_element_ty, 0);
+        set_value_type_fact(ctx, value, fact);
+    }
+    Ok(())
+}
+
+fn legacy_fact_from_mir_type(
+    ctx: &mut Context,
+    mir_ty: Ptr<TypeObj>,
+) -> std::result::Result<Option<LegacyType>, anyhow::Error> {
+    let maybe_ptr = {
+        let ty_ref = mir_ty.deref(ctx);
+        ty_ref
+            .downcast_ref::<MirPtrType>()
+            .map(|ptr| (ptr.pointee, ptr.address_space))
+    };
+    if let Some((pointee, addrspace)) = maybe_ptr {
+        let llvm_pointee = convert_type(ctx, pointee)?;
+        return Ok(Some(LegacyType::pointer_to_llvm(
+            ctx,
+            llvm_pointee,
+            addrspace,
+        )));
+    }
+
+    let maybe_slice = {
+        let ty_ref = mir_ty.deref(ctx);
+        ty_ref
+            .downcast_ref::<MirSliceType>()
+            .map(|slice| slice.element_type())
+            .or_else(|| {
+                ty_ref
+                    .downcast_ref::<MirDisjointSliceType>()
+                    .map(|slice| slice.element_type())
+            })
+    };
+    if let Some(element_ty) = maybe_slice {
+        let llvm_element_ty = convert_type(ctx, element_ty)?;
+        let len_ty = IntegerType::get(ctx, 64, Signedness::Signless);
+        return Ok(Some(LegacyType::Struct(vec![
+            LegacyType::pointer_to_llvm(ctx, llvm_element_ty, 0),
+            LegacyType::Scalar(len_ty.into()),
+        ])));
+    }
+
+    Ok(None)
 }
 
 // ============================================================================

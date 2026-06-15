@@ -61,6 +61,7 @@ use dialect_mir::ops::MirCastOp;
 use dialect_mir::types::{MirArrayType, MirPtrType};
 use llvm_export::op_interfaces::CastOpInterface;
 use llvm_export::ops as llvm;
+use llvm_export::pointer_facts::{LegacyType, set_value_type_fact};
 use llvm_export::types::FuncType;
 use pliron::builtin::op_interfaces::CallOpCallable;
 use pliron::builtin::type_interfaces::FloatTypeInterface;
@@ -75,6 +76,14 @@ use pliron::operation::Operation;
 use pliron::printable::Printable;
 use pliron::result::Result;
 use pliron::r#type::{Typed, type_cast};
+
+fn anyhow_to_pliron(e: anyhow::Error) -> pliron::result::Error {
+    pliron::create_error!(
+        pliron::location::Location::Unknown,
+        pliron::result::ErrorKind::VerificationFailed,
+        pliron::result::StringError(e.to_string())
+    )
+}
 
 /// Convert a MIR cast operation to the appropriate LLVM cast instruction.
 ///
@@ -340,13 +349,13 @@ fn emit_unsize_cast(
     llvm_ty: Ptr<pliron::r#type::TypeObj>,
     mir_opd_ty: Ptr<pliron::r#type::TypeObj>,
 ) -> Result<Ptr<Operation>> {
-    let array_len = {
+    let array_unsize = {
         let mir_ref = mir_opd_ty.deref(ctx);
         mir_ref.downcast_ref::<MirPtrType>().and_then(|ptr_ty| {
             let pointee_ref = ptr_ty.pointee.deref(ctx);
             if let Some(arr) = pointee_ref.downcast_ref::<MirArrayType>() {
                 // `&[T; N] -> &[T]`: the classic array unsize.
-                Some(arr.size())
+                Some((arr.size(), Some((ptr_ty.pointee, arr.element_type()))))
             } else if let Some(struct_ty) =
                 pointee_ref.downcast_ref::<dialect_mir::types::MirStructType>()
             {
@@ -363,7 +372,7 @@ fn emit_unsize_cast(
                 field_types.get(last_decl_idx).and_then(|t| {
                     t.deref(ctx)
                         .downcast_ref::<MirArrayType>()
-                        .map(|a| a.size())
+                        .map(|a| (a.size(), None))
                 })
             } else {
                 None
@@ -371,15 +380,39 @@ fn emit_unsize_cast(
         })
     };
 
-    if let Some(len) = array_len {
+    if let Some((len, direct_array)) = array_unsize {
         let dst_is_struct = llvm_ty.deref(ctx).is::<llvm_export::types::StructType>();
 
         if dst_is_struct {
+            let data_ptr = if let Some((array_ty, element_ty)) = direct_array {
+                let llvm_array_ty = convert_type(ctx, array_ty).map_err(anyhow_to_pliron)?;
+                let llvm_element_ty = convert_type(ctx, element_ty).map_err(anyhow_to_pliron)?;
+                let gep = llvm::GetElementPtrOp::new(
+                    ctx,
+                    val,
+                    vec![llvm::GepIndex::Constant(0), llvm::GepIndex::Constant(0)],
+                    llvm_array_ty,
+                );
+                rewriter.insert_operation(ctx, gep.get_operation());
+                let gep_res = gep.get_operation().deref(ctx).get_result(0);
+                let addrspace = val_ty
+                    .deref(ctx)
+                    .downcast_ref::<llvm_export::types::PointerType>()
+                    .map_or(0, llvm_export::types::PointerType::address_space);
+                let src_fact = LegacyType::pointer_to_llvm(ctx, llvm_array_ty, addrspace);
+                set_value_type_fact(ctx, val, src_fact);
+                let res_fact = LegacyType::pointer_to_llvm(ctx, llvm_element_ty, addrspace);
+                set_value_type_fact(ctx, gep_res, res_fact);
+                gep_res
+            } else {
+                val
+            };
+
             let undef = llvm::UndefOp::new(ctx, llvm_ty);
             rewriter.insert_operation(ctx, undef.get_operation());
             let undef_val = undef.get_operation().deref(ctx).get_result(0);
 
-            let insert_ptr = llvm::InsertValueOp::new(ctx, undef_val, val, vec![0]);
+            let insert_ptr = llvm::InsertValueOp::new(ctx, undef_val, data_ptr, vec![0]);
             rewriter.insert_operation(ctx, insert_ptr.get_operation());
             let with_ptr = insert_ptr.get_operation().deref(ctx).get_result(0);
 
