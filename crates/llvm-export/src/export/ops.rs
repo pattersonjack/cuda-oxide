@@ -664,6 +664,15 @@ impl<'a> ModuleExportState<'a> {
         let res_name = value_names.get(&res).unwrap();
         let arg = op_ref.get_operand(0);
 
+        if self.uses_legacy_typed_pointers() {
+            write!(output, "  {res_name} = fsub ").unwrap();
+            self.export_value_type(arg, output)?;
+            write!(output, " {}, ", format_float_literal(-0.0)).unwrap();
+            self.export_value(arg, value_names, output)?;
+            writeln!(output).unwrap();
+            return Ok(());
+        }
+
         write!(output, "  {res_name} = fneg ").unwrap();
         self.export_value_type(arg, output)?;
         write!(output, " ").unwrap();

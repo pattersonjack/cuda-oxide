@@ -4,10 +4,14 @@
  */
 
 use llvm_export::{
+    attributes::FastmathFlagsAttr,
     export::{
         NvvmLegacyExportConfig, export_module_to_string, export_module_to_string_with_config,
     },
-    ops::{AddressOfOp, BrOp, FuncOp, GepIndex, GetElementPtrOp, GlobalOp, InlineAsmOp, ReturnOp},
+    ops::{
+        AddressOfOp, BrOp, FNegOp, FuncOp, GepIndex, GetElementPtrOp, GlobalOp, InlineAsmOp,
+        ReturnOp,
+    },
     types::{FuncType, PointerType, VoidType},
 };
 use pliron::{
@@ -58,6 +62,41 @@ fn legacy_nvvm_export_infers_typed_pointer_argument_from_load() {
     assert!(
         !ir.contains(" ptr"),
         "legacy NVVM export must not emit opaque pointer spelling:\n{ir}"
+    );
+}
+
+#[test]
+fn legacy_nvvm_export_lowers_fneg_to_old_llvm_spelling() {
+    let mut ctx = Context::new();
+
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_region = module.get_operation().deref(&ctx).get_region(0);
+    let module_block = module_region.deref(&ctx).iter(&ctx).next().unwrap();
+
+    let double_ty = FP64Type::get(&ctx);
+    let func_ty = FuncType::get(&mut ctx, double_ty.into(), vec![double_ty.into()], false);
+    let func = FuncOp::new(&mut ctx, "negates_double".try_into().unwrap(), func_ty);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    let arg = entry.deref(&ctx).get_argument(0);
+
+    let neg = FNegOp::new_with_fast_math_flags(&mut ctx, arg, FastmathFlagsAttr::default());
+    let neg_result = neg.get_operation().deref(&ctx).get_result(0);
+    neg.get_operation().insert_at_back(entry, &ctx);
+    ReturnOp::new(&mut ctx, Some(neg_result))
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let ir = export_module_to_string_with_config(&ctx, &module, &NvvmLegacyExportConfig)
+        .expect("legacy export succeeds");
+
+    assert!(
+        ir.contains("fsub double -0.0, %v0"),
+        "legacy NVVM export must avoid the LLVM 8+ fneg opcode:\n{ir}"
+    );
+    assert!(
+        !ir.contains(" fneg "),
+        "legacy NVVM export must not emit fneg:\n{ir}"
     );
 }
 
