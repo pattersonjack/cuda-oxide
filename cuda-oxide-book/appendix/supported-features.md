@@ -79,7 +79,7 @@ layout-aware field decoding rather than the primitive byte-slicing rule.
 | Feature | Status | Description |
 |:--------|:-------|:------------|
 | `#[kernel]` Attribute | **Full** | Marks functions as GPU kernel entry points (`ptx_kernel` calling convention). Multiple kernels per file. |
-| `#[device]` Helper Functions | **Full** | Device-side helper functions callable from kernels. Inlined aggressively by `llc`. |
+| `#[device]` Helper Functions | **Full** | Device-side helper functions callable from kernels. `#[inline(always)]` is preserved as the LLVM `alwaysinline` attribute (emitted alongside the convergent group and any `!dbg` scope), so `opt` honors the inline intent. |
 | Standalone `#[device]` Functions | **Full** | Device functions compiled without any kernel present. Clean export names for C++ consumption. |
 | Multi-Kernel Modules | **Full** | Multiple `#[kernel]` functions in a single source file compile to a single PTX module. |
 

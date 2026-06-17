@@ -464,6 +464,89 @@ fn line_table_debug_metadata_emits_function_scope_and_instruction_locations() {
 }
 
 #[test]
+fn export_alwaysinline_function_attribute_uses_llvm_define_syntax() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(&mut ctx, void_ty.to_ptr(), vec![], false);
+    let func = FuncOp::new(&mut ctx, "inline_helper".try_into().unwrap(), func_ty);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+
+    let key: pliron::identifier::Identifier = "alwaysinline".try_into().unwrap();
+    func.get_operation()
+        .deref_mut(&ctx)
+        .attributes
+        .set(key, StringAttr::new("true".to_string()));
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let ir = export_module_to_string(&ctx, &module).expect("export succeeds");
+    let define_line = ir
+        .lines()
+        .find(|line| line.starts_with("define void @inline_helper("))
+        .expect("inline helper definition");
+    assert_eq!(
+        define_line, "define void @inline_helper() alwaysinline #0 {",
+        "`alwaysinline` must be emitted after the parameter list, before attr group #0:\n{ir}"
+    );
+    assert!(
+        ir.contains("attributes #0 = { convergent }"),
+        "convergent attribute group must still be emitted:\n{ir}"
+    );
+}
+
+#[test]
+fn export_alwaysinline_coexists_with_debug_scope() {
+    // alwaysinline and the !dbg scope are emitted on the same define line and
+    // must not crowd each other out. This guards the 4-way emission: a future
+    // change that drops either one when both are present fails here.
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(&mut ctx, void_ty.to_ptr(), vec![], false);
+    let func = FuncOp::new(&mut ctx, "inline_helper".try_into().unwrap(), func_ty);
+    let func_loc = src_location(&mut ctx, "/tmp/cuda-oxide/tests/kernel.rs", 7, 1);
+    func.get_operation().deref_mut(&ctx).set_loc(func_loc);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    let ret = ReturnOp::new(&mut ctx, None);
+    let ret_loc = src_location(&mut ctx, "/tmp/cuda-oxide/tests/kernel.rs", 8, 5);
+    ret.get_operation().deref_mut(&ctx).set_loc(ret_loc);
+    ret.get_operation().insert_at_back(entry, &ctx);
+
+    let key: pliron::identifier::Identifier = "alwaysinline".try_into().unwrap();
+    func.get_operation()
+        .deref_mut(&ctx)
+        .attributes
+        .set(key, StringAttr::new("true".to_string()));
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let config = DebugConfig {
+        inner: PtxExportConfig,
+        debug_kind: DebugKind::LineTables,
+    };
+    let ir =
+        export_module_to_string_with_config(&ctx, &module, &config).expect("debug export succeeds");
+    let define_line = ir
+        .lines()
+        .find(|line| line.starts_with("define void @inline_helper("))
+        .expect("inline helper definition");
+    assert!(
+        define_line.contains("alwaysinline"),
+        "alwaysinline must survive when debug info is on:\n{ir}"
+    );
+    assert!(
+        define_line.contains("!dbg !"),
+        "!dbg scope must survive when alwaysinline is present:\n{ir}"
+    );
+}
+
+#[test]
 fn line_table_debug_metadata_uses_file_scope_for_cross_file_locations() {
     let mut ctx = Context::new();
 
