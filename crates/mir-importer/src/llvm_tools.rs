@@ -263,7 +263,7 @@ fn describe_tool(path: &str, major: Option<u32>) -> String {
 
 /// Extracts the LLVM major from `--version` output. Handles both distro
 /// (`"Ubuntu LLVM version 21.1.8"`) and rustc llvm-tools
-/// (`"LLVM version 22.1.2-rust-1.96.0-nightly"`) banners.
+/// (`"LLVM version 22.1.7-rust-1.98.0-nightly"`) banners.
 pub(crate) fn parse_llvm_major(version_output: &str) -> Option<u32> {
     const NEEDLE: &str = "LLVM version ";
     let idx = version_output.find(NEEDLE)?;
@@ -354,7 +354,7 @@ mod tests {
         );
         assert_eq!(
             parse_llvm_major(
-                "LLVM (http://llvm.org/):\n  LLVM version 22.1.2-rust-1.96.0-nightly\n"
+                "LLVM (http://llvm.org/):\n  LLVM version 22.1.7-rust-1.98.0-nightly\n"
             ),
             Some(22)
         );

@@ -53,10 +53,10 @@ use pliron::r#type::{TypeObj, Typed};
 use pliron::utils::apint::APInt;
 use pliron::value::Value;
 use pliron::{input_err, input_err_noloc, input_error, input_error_noloc};
-use rustc_public::CrateDef;
 use rustc_public::mir;
 use rustc_public::mir::ProjectionElem;
 use rustc_public::ty::{AdtKind, ConstantKind};
+use rustc_public::{CrateDef, CrateDefType};
 use rustc_public_bridge::IndexedVal;
 use std::num::NonZeroUsize;
 
@@ -701,9 +701,14 @@ pub fn translate_rvalue(
                 ),
             }
         }
-        mir::Rvalue::Use(operand) => {
+        mir::Rvalue::Use(operand, _) => {
             // Use just copies/moves a value - no operation needed, just pass through
             // The operand translation may insert field extraction operations
+            //
+            // The retag flag is alias/provenance metadata with no runtime
+            // lowering here. Older rustc_public exposed retags as
+            // StatementKind::Retag, which this importer also skipped as
+            // codegen-irrelevant.
             let (val, last_inserted) =
                 translate_operand(ctx, body, operand, value_map, block_ptr, prev_op, loc)?;
 

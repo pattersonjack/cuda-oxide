@@ -156,4 +156,4 @@ cargo oxide pipeline <example_name>
 
 ### Nightly Rust
 
-The backend uses `#![feature(rustc_private)]` and pins to a specific nightly via `rust-toolchain.toml`. The workspace currently uses `nightly-2026-04-03`.
+The backend uses `#![feature(rustc_private)]` and pins to a specific nightly via `rust-toolchain.toml`. The workspace currently uses `nightly-2026-06-16`.
