@@ -77,11 +77,11 @@ fn main() {
     // Each thread i computes: scale*i + (scale*i+1) + (scale*i+2) + (scale*i+3)
     //                        = 4*scale*i + 6
     let mut errors = 0usize;
-    for i in 0..N {
+    for (i, &val) in out.iter().enumerate() {
         let expected = 4 * scale * (i as u32) + 6;
-        if out[i] != expected {
+        if val != expected {
             if errors < 5 {
-                eprintln!("  FAIL [{}]: got {} want {}", i, out[i], expected);
+                eprintln!("  FAIL [{}]: got {} want {}", i, val, expected);
             }
             errors += 1;
         }
